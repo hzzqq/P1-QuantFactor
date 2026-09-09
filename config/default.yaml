@@ -1,0 +1,31 @@
+project: P1-QuantFactor
+seed: 42
+
+data:
+  start_date: "2015-01-01"
+  end_date: "2026-08-30"
+  adjust: qfq                # 前复权（qfq）
+  benchmark: sh000300        # 沪深300，用于计算超额收益
+  segment_years: 2           # 腾讯单次最多 640 行，按 2 年分段抓取
+
+  request:
+    timeout: 15
+    max_workers: 4           # 并发线程数。腾讯对高频请求返回 501 限流，
+                             # 超过 6 并发会大量失败，实测 4 并发稳定
+    retries: 3
+    retry_sleep: 2.0         # 限流后的基础退避秒数（指数放大 + 随机抖动）
+    sleep: 0.35              # 每次请求间隔。约 11 req/s，是速度与封禁的平衡点
+
+universe:
+  exclude_st: true           # 剔除 ST / *ST
+  exclude_bj: true           # 剔除北交所（流动性差）
+  min_listing_days: 250      # 上市满 N 个交易日才纳入
+  max_by_market_cap: 1500    # 只保留流通市值前 N 只。
+                             # 小盘股流动性差、噪声大，且抓取全市场会持续触发腾讯限流
+
+features:
+  windows: [5, 10, 20, 60, 120]
+
+label:
+  horizon: 10                # 预测未来 N 日
+  type: excess               # 相对基准的超额收益，非绝对收益

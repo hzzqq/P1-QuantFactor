@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+logs/
+*.log
+data/
+models/*.bin
+models/*.pt
+.ipynb_checkpoints/
