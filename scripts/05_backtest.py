@@ -65,7 +65,27 @@ def main() -> int:
                     help="回测结束日（含），如 2026-08-14")
     ap.add_argument("--buffer", type=float, default=0.0,
                     help="缓冲区宽度（排名分位）；>0 启用连续持仓+缓冲区调仓（降换手）")
+    ap.add_argument("--allow-rf-mismatch", action="store_true",
+                    help="显式放行 rf != horizon（默认禁止）。仅在刻意做重叠桶实验时使用。")
+    ap.add_argument("--max-rf-mismatch", type=int, default=0,
+                    help="允许的 |rf - horizon| 上限；默认 0（必须相等）")
     args = ap.parse_args()
+
+    # --- 防 rf != horizon 的静默错配护栏 ---
+    # 背景：曾把 rf 误设为 15（horizon=10），桶重叠导致年化/夏普口径失真，
+    # 全量 EV 2026 净收益被压成 −1.87%；对齐 rf=10 后为 +10.68%（夏普 1.04）。
+    # 该错配**不报错、不崩溃**，只让指标偏负，属静默失败，故在此硬拦。
+    gap = abs(args.rebalance_freq - args.horizon)
+    if gap > args.max_rf_mismatch:
+        msg = (f"\n[护栏] rf({args.rebalance_freq}) != horizon({args.horizon})，"
+               f"差值 {gap} > 上限 {args.max_rf_mismatch}。\n"
+               f"  调仓频率与标签窗口不一致会使桶重叠，收益/夏普口径失真"
+               f"（历史事故：rf=15 vs horizon=10 把 2026 全量净收益从 +10.68% 压到 −1.87%）。\n"
+               f"  如确为刻意实验，请显式加 --allow-rf-mismatch。")
+        if not args.allow_rf_mismatch:
+            logger.error(msg)
+            return 2
+        logger.warning(msg + "\n  [已按 --allow-rf-mismatch 放行]")
 
     panel_path = args.panel or (PROCESSED / "panel.parquet")
     panel = pd.read_parquet(panel_path)
