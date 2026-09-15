@@ -79,8 +79,31 @@ def collect() -> list[Path]:
     return out
 
 
+def collect_dst_only() -> list[Path]:
+    """目标侧独有的受管文件（源侧不存在）。
+
+    为什么需要它：`collect()` 只从**源侧**枚举，因此目标侧多出来的文件永远看不见。
+    这曾导致一个真实漏检——在 `_qf/src/` 手写一个源侧没有的文件，
+    `--check` 与门禁都报「一致」。单向同步的语义是「目标侧的内容应等于源侧」，
+    所以目标侧独有文件同样是漂移，必须报出来。
+    注意这些文件**不会被自动删除**（只报告，交人判断是补到源侧还是删掉）。
+    """
+    if not DST.is_dir():
+        return []
+    src_set = {r.as_posix() for r in collect()}
+    out, seen = [], set()
+    for tree in SYNC_TREES:
+        for rel in _iter_files(DST, tree):
+            key = rel.as_posix()
+            if key in src_set or key in seen:
+                continue
+            seen.add(key)
+            out.append(rel)
+    return out
+
+
 def compare() -> tuple[list[Path], list[Path], list[Path]]:
-    """返回 (新增, 内容不同, 已一致)。"""
+    """返回 (新增, 内容不同, 已一致)。已一致不含目标侧独有文件。"""
     new, changed, same = [], [], []
     for rel in collect():
         s, d = SRC / rel, DST / rel
@@ -126,10 +149,12 @@ def main() -> int:
         return 2
 
     new, changed, same = compare()
+    dst_only = collect_dst_only()
     print(f"源  : {SRC}")
     print(f"目标: {DST}")
     print(f"应同步文件 {len(new) + len(changed) + len(same)} 个 | "
-          f"新增 {len(new)} | 内容不同 {len(changed)} | 已一致 {len(same)}")
+          f"新增 {len(new)} | 内容不同 {len(changed)} | 已一致 {len(same)} | "
+          f"目标侧独有 {len(dst_only)}")
     print("-" * 62)
 
     for rel in new:
@@ -142,18 +167,27 @@ def main() -> int:
             shown += 1
     if len(changed) > args.max_diff:
         print(f"  ... 另有 {len(changed) - args.max_diff} 个文件有差异未展开")
+    for rel in dst_only:
+        print(f"  [目标侧独有·需人工判断] {rel.as_posix()}")
 
     todo = len(new) + len(changed)
-    if todo == 0:
+    if todo == 0 and not dst_only:
         print("\n两侧已一致，无需同步。")
         return 0
 
     if args.check:
-        print(f"\n[CHECK] 存在 {todo} 处差异（未修改任何文件）。执行 --apply 以同步。")
+        parts = []
+        if todo:
+            parts.append(f"{todo} 处待同步")
+        if dst_only:
+            parts.append(f"{len(dst_only)} 个目标侧独有文件（本工具不删，需人工判断）")
+        print(f"\n[CHECK] " + "；".join(parts) + "。未修改任何文件。")
         return 1
 
     if args.dry:
         print(f"\n[DRY] 将写入 {todo} 个文件（本次未落盘）。")
+        if dst_only:
+            print(f"      {len(dst_only)} 个目标侧独有文件不会被删除，需人工判断。")
         return 0
 
     written = 0
@@ -163,6 +197,11 @@ def main() -> int:
         shutil.copy2(s, d)
         written += 1
     print(f"\n[OK] 已同步 {written} 个文件到 _qf。")
+    if dst_only:
+        print(f"     ⚠️ 目标侧另有 {len(dst_only)} 个源侧不存在的受管文件，本工具**不删除**：")
+        for rel in dst_only:
+            print(f"        - {rel.as_posix()}")
+        print("        请判断：应保留（则补到 P1-QuantFactor）还是删除（则手工 rm）。")
     print("     下一步：cd _qf && git status && git diff，确认后自行 commit。")
     return 0
 
