@@ -7,6 +7,8 @@ from .engine import (
     BacktestResult,
     run_backtest,
     run_backtest_continuous,
+    _apply_vol_target,
+    compute_liquidity_slippage,
 )
 
 __all__ = [
@@ -17,4 +19,6 @@ __all__ = [
     "BacktestResult",
     "run_backtest",
     "run_backtest_continuous",
+    "_apply_vol_target",
+    "compute_liquidity_slippage",
 ]

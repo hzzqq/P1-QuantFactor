@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -62,19 +63,41 @@ def derive_real() -> pd.DataFrame:
     return out
 
 
+# 护栏：baostock 覆盖率低于此值 → 拒绝构建 v40（避免中位数伪造造成的静默污染）。
+# 部分成功比没有更危险：缺失被中位数填充会伪造一批"平均股"，反而污染模型。
+MIN_COVERAGE = 0.95
+
+
 def augment(src_name: str, dst_name: str, new_factors: list[str]) -> None:
     rf = derive_real()
     t0 = time.time()
     df = pd.read_parquet(PROCESSED / src_name)
+    ds_syms = set(df["symbol"].astype(str).unique())
+    rf_syms = set(rf["symbol"].astype(str).unique())
+    covered = ds_syms & rf_syms
+    coverage = len(covered) / len(ds_syms) if ds_syms else 0.0
+    print(f"[32] 数据集 {len(ds_syms)} 只，baostock 覆盖 {len(covered)} 只，"
+          f"覆盖率 {coverage:.1%}", flush=True)
+    # 护栏：覆盖率不足 → 拒绝伪造（部分成功比没有更危险）
+    if coverage < MIN_COVERAGE:
+        if os.environ.get("P1_ALLOW_PARTIAL"):
+            print(f"[32] ⚠️ 覆盖率 {coverage:.1%} < {MIN_COVERAGE:.0%}，"
+                  f"但 P1_ALLOW_PARTIAL=1 → 仍构建（抽样验证用途，非全量生产）", flush=True)
+        else:
+            raise RuntimeError(
+                f"[32] 覆盖率 {coverage:.1%} < {MIN_COVERAGE:.0%}，拒绝中位数填充伪造。"
+                f"仅覆盖 {len(covered)}/{len(ds_syms)} 只。请先补齐 baostock 全量再构建 v40。")
     merged = df.merge(rf, on=["date", "symbol"], how="left")
-    n_missing = int(merged[new_factors].isna().all(axis=1).sum())
-    print(f"[32] {src_name}: 合并真实因子后整行缺失 {n_missing} "
-          f"({n_missing/len(merged)*100:.3f}%)", flush=True)
-    for c in new_factors:
-        if merged[c].isna().any():
-            med = merged[c].median()
-            merged[c] = merged[c].fillna(med)
-            print(f"[32]   {c} 用中位数 {med:.4f} 填充剩余缺失")
+    # 改「中位数填充」为「丢弃新因子缺失行」：日期缺口不伪造，宁可少数据不实造
+    n_before = len(merged)
+    merged = merged.dropna(subset=new_factors)
+    n_dropped = n_before - len(merged)
+    print(f"[32] 丢弃新因子缺失行 {n_dropped}（{n_dropped/n_before:.3%}），不填充", flush=True)
+    if merged[new_factors].isna().any().any():
+        # 理论上 dropna 后已无缺失；极小残留前向填充兜底
+        for c in new_factors:
+            merged[c] = merged[c].ffill().bfill()
+        print("[32]   仍有残留 NaN，前向填充兜底")
     # 列序：原因子 + 新因子 + 标签
     factor_cols = [c for c in df.columns if c not in ("date", "symbol")]
     label_cols = [c for c in factor_cols if c.startswith("y_")]
@@ -89,10 +112,11 @@ def augment(src_name: str, dst_name: str, new_factors: list[str]) -> None:
     meta["symbols"] = int(merged["symbol"].nunique())
     meta["added_factors"] = new_factors
     meta["added_source"] = "baostock_daily: log_mktcap_real=log(close*vol*100/turn), turnover_daily=turn/100"
+    meta["coverage"] = round(coverage, 4)
     meta["built_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     with open(PROCESSED / dst_name.replace(".parquet", "_meta.json"), "w", encoding="utf-8") as fh:
         json.dump(meta, fh, ensure_ascii=False, indent=2)
-    print(f"[32] 写出 {dst_name}（{len(merged):,} 行, {len(new_feats)} 因子）"
+    print(f"[32] 写出 {dst_name}（{len(merged):,} 行, {len(new_feats)} 因子, 覆盖率 {coverage:.1%}）"
           f" + meta，{time.time()-t0:.1f}s", flush=True)
 
 

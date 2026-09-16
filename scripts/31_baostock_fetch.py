@@ -222,14 +222,37 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.combine:
-        parts = sorted(glob.glob(str(OUTDIR / "baostock_daily_batch_*.parquet")))
+        # 只收已完成的整片（baostock_daily_batch_NNN.parquet），**排除** .partial.parquet，
+        # 否则会把未拉完的残片混进最终结果 → 静默损坏（2026-09-15 已踩：8 片混出 738 只假全集）。
+        parts = sorted(glob.glob(str(OUTDIR / "baostock_daily_batch_[0-9][0-9][0-9].parquet")))
         if not parts:
             print("[31] 无分片可合并")
             return 1
-        df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
-        df.to_parquet(OUTDIR / "baostock_daily.parquet", index=False)
-        print(f"[31] 合并 {len(parts)} 片 → baostock_daily.parquet ({len(df):,} 行, "
-              f"{df['symbol'].nunique()} 只)")
+        present = sorted({int(Path(p).stem.split("_")[-1]) for p in parts})
+        expected = set(range(args.n_batches))
+        missing = sorted(expected - set(present))
+        if missing:
+            # 缺片不允许合并：避免用残缺数据冒充全量。
+            print(f"[31] 合并中止：缺片 {missing}（共需 {args.n_batches} 片，"
+                  f"已就绪 {present}）。请先补全缺失片再 --combine。")
+            return 1
+        frames = [pd.read_parquet(p) for p in parts]
+        df = pd.concat(frames, ignore_index=True)
+        before = len(df)
+        # 不同参数历史运行可能残留重复 symbol/date 组合，合并后强制去重。
+        dup_cols = ["date", "symbol"] if "symbol" in df.columns else None
+        if dup_cols:
+            df = df.drop_duplicates(subset=dup_cols)
+        after = len(df)
+        if after < before:
+            print(f"[31] 合并去重：{before:,} → {after:,} 行（剔除 {before-after:,} 重复）")
+        out = OUTDIR / "baostock_daily.parquet"
+        df.to_parquet(out, index=False)
+        n_sym = df["symbol"].nunique() if "symbol" in df.columns else "?"
+        dmin = df["date"].min().date() if "date" in df.columns else "?"
+        dmax = df["date"].max().date() if "date" in df.columns else "?"
+        print(f"[31] 合并 {len(parts)} 片 → baostock_daily.parquet "
+              f"({after:,} 行, {n_sym} 只, date {dmin}~{dmax})")
         return 0
 
     syms = load_symbols()

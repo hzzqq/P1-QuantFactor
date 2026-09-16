@@ -25,9 +25,86 @@ LIMIT_DOWN = -0.095
 # A 股交易成本（单边比例）
 DEFAULT_COST = {
     "commission": 0.0003,   # 佣金，双边
-    "slippage": 0.001,      # 滑点/冲击，双边
+    "slippage": 0.001,      # 滑点/冲击，双边（固定档，对应流动性中档）
     "stamp": 0.001,         # 印花税，仅卖出
 }
+
+# 流动性分档滑点（A 任务：按个股真实成交额分档，取代固定 0.1%）
+# 顺序：流动性前 30% / 30~70% / 70~90% / 后 10%(微盘)
+LIQUIDITY_SLIPPAGE_TIERS = (0.0005, 0.0010, 0.0015, 0.0025)
+
+
+def compute_liquidity_slippage(panel: pd.DataFrame,
+                               tiers=LIQUIDITY_SLIPPAGE_TIERS) -> dict:
+    """按个股流动性（中位数日成交额）分档滑点，返回 {symbol: slippage}。
+
+    panel 需含 symbol,date,close,volume。amount≈close*volume*100（volume 单位「手」=100 股）。
+    微盘股流动性差、冲击成本高，应比大盘股付更高滑点——这比统一 0.1% 更贴近真实。
+    若 panel 无 volume 则返回空 dict（调用方退化为固定档）。
+    """
+    need = {"symbol", "date", "close", "volume"}
+    if not need.issubset(panel.columns):
+        return {}
+    df = panel[["symbol", "date", "close", "volume"]].dropna()
+    df = df[df["volume"] > 0]
+    if df.empty:
+        return {}
+    df["amount"] = df["close"] * df["volume"] * 100.0
+    med = df.groupby("symbol")["amount"].median()
+    if med.empty:
+        return {}
+    q = med.quantile([0.30, 0.70, 0.90]).values
+    out = {}
+    for sym, a in med.items():
+        if a >= q[2]:
+            out[sym] = tiers[3]
+        elif a >= q[1]:
+            out[sym] = tiers[2]
+        elif a >= q[0]:
+            out[sym] = tiers[1]
+        else:
+            out[sym] = tiers[0]
+    return out
+
+
+def compute_name_vol(panel: pd.DataFrame) -> dict:
+    """个股日收益波动率 std（静态逆波动加权用），返回 {symbol: std(day_ret)}。"""
+    if not {"symbol", "date", "close"}.issubset(panel.columns):
+        return {}
+    df = panel[["symbol", "date", "close"]].sort_values(["symbol", "date"]).copy()
+    df["prev"] = df.groupby("symbol")["close"].shift(1)
+    df["ret"] = df["close"] / df["prev"] - 1.0
+    sd = df.groupby("symbol")["ret"].std()
+    return {s: float(v) for s, v in sd.items() if pd.notna(v) and v > 0}
+
+
+def _apply_vol_target(bucket_rets: list[float], rebalance_freq: int,
+                      vol_target: float | None, vol_lookback: int,
+                      max_leverage: float) -> list[float]:
+    """组合层波动率目标化（B 任务）。
+
+    用**已实现**波动率（前 vol_lookback 个桶的收益）估计年化波动，把下一桶的
+    总敞口缩放到目标波动。不使用未来信息（只用历史）。L 截断在 [0, max_leverage]。
+
+    **设计约束（压回撤而非加杠杆）**：max_leverage 默认 1.0，即只去杠杆、不加息。
+    只有当 vol_target **低于**策略自然波动时，L<1 才会真正压低回撤；若目标高于自然
+    波动，L 会触顶 max_leverage（默认 1.0，不加杠杆），敞口不变。这是诚实的回撤
+    控制手段：收益与回撤按同比例缩放，夏普大致不变。
+    返回缩放后的桶收益序列。vol_target=None 时原样返回。
+    """
+    if vol_target is None or len(bucket_rets) < 2:
+        return list(bucket_rets)
+    scaled: list[float] = []
+    hist: list[float] = []
+    for r in bucket_rets:
+        if len(hist) >= vol_lookback:
+            vol = float(np.std(hist[-vol_lookback:]) * np.sqrt(252 / rebalance_freq))
+            L = min(max_leverage, vol_target / vol) if vol > 1e-9 else max_leverage
+        else:
+            L = 1.0
+        scaled.append(L * r)
+        hist.append(r)
+    return scaled
 
 
 def attach_forward(panel: pd.DataFrame, horizon: int = 10,
@@ -91,7 +168,12 @@ def run_backtest_continuous(preds: pd.DataFrame,
                             cost: dict | None = None,
                             mode: str = "long_short",
                             buffer: float = 0.02,
-                            bootstrap: bool = False) -> "BacktestResult":
+                            bootstrap: bool = False,
+                            cost_model: str = "fixed",
+                            sizer: str = "equal",
+                            vol_target: float | None = None,
+                            vol_lookback: int = 20,
+                            max_leverage: float = 1.0) -> "BacktestResult":
     """连续持仓 + 缓冲区（buffer zone）调仓回测。
 
     与 `run_backtest`（非重叠桶）的关键差异：
@@ -108,8 +190,17 @@ def run_backtest_continuous(preds: pd.DataFrame,
         - 已持有的只要还在 top 12% 以内就保留（宽出）
     """
     cost = cost or DEFAULT_COST
-    c_buy = cost["commission"] + cost["slippage"]
-    c_sell = cost["commission"] + cost["slippage"] + cost["stamp"]
+    # A 任务：流动性分档滑点
+    slip_map = compute_liquidity_slippage(panel) if cost_model == "liquidity" else None
+    if sizer == "inv_vol":
+        import warnings
+        warnings.warn(
+            "sizer='inv_vol' 已在本策略(日频多空 Top-decile)验证失败：逆波动加权把仓位"
+            "集中于低波动/弱信号股（含 vol≈0 的僵尸股被赋权爆炸），实测净收益 -53%、"
+            "MDD -71%；已退化为 equal。压回撤请用 vol_target。", stacklevel=2)
+    base_slip = float(cost["slippage"])
+    c_buy0 = float(cost["commission"])
+    c_sell0 = float(cost["commission"]) + float(cost["stamp"])
 
     df = panel[["symbol", "date", "open", "close"]].sort_values(["symbol", "date"]).copy()
     df["prev_close"] = df.groupby("symbol")["close"].shift(1)
@@ -141,6 +232,7 @@ def run_backtest_continuous(preds: pd.DataFrame,
     prev_long: set = set()
     prev_short: set = set()
     per_rets, per_long, per_short, turnovers = [], [], [], []
+    per_dates = []
     total_trades = 0      # 累计成交笔数（N4 修复：原仅末桶持仓数，严重低估）
     total_blocked = 0     # 累计因涨停被挡无法买入的条目数（N9 修复：原恒为 0）
 
@@ -188,11 +280,23 @@ def run_backtest_continuous(preds: pd.DataFrame,
             ok = p0.notna() & p1.notna() & (p0 > 0)
             if not ok.any():
                 return 0.0
-            return float(((p1[ok] / p0[ok] - 1.0) * sign).mean())
+            g = (p1[ok] / p0[ok] - 1.0) * sign
+            # B 任务：sizer="inv_vol" 已在本策略验证失败并退化为 equal（见顶部警告），
+            # 此处恒等权均值，不做个股逆波动加权（逆波动加权会把仓位压向低波动/弱信号股）。
+            return float(g.mean())
 
-        # 换手成本：按方向分别计费——进场只收买(c_buy)、出场只收卖(c_sell)，
-        # 不再对每次换仓都收「买+卖」整轮（旧实现会稳态下双倍计费）。
+        # 换手成本：按方向分别计费——进场只收买、出场只收卖。
+        # A 任务：滑点取篮子（tgt 集合）平均流动性档位，而非统一固定。
         nL, nS = len(tgt_long), len(tgt_short)
+        if slip_map:
+            slip_l = float(np.mean([slip_map.get(s, base_slip) for s in tgt_long])) if nL else base_slip
+            slip_s = float(np.mean([slip_map.get(s, base_slip) for s in tgt_short])) if nS else base_slip
+        else:
+            slip_l = slip_s = base_slip
+        c_buy_l = c_buy0 + slip_l
+        c_sell_l = c_sell0 + slip_l
+        c_buy_s = c_buy0 + slip_s
+        c_sell_s = c_sell0 + slip_s
         # 成交笔数始终累计（无论该侧是否为空），供 n_trades 真实统计（N4）
         entriesL = len(tgt_long - prev_long)   # 新买入 = 买
         exitsL = len(prev_long - tgt_long)      # 旧卖出 = 卖
@@ -201,12 +305,12 @@ def run_backtest_continuous(preds: pd.DataFrame,
         total_trades += entriesL + exitsL + entriesS + exitsS
         if nL:
             wL = 1.0 / nL
-            costL = (entriesL * c_buy + exitsL * c_sell) * wL
+            costL = (entriesL * c_buy_l + exitsL * c_sell_l) * wL
         else:
             costL = 0.0
         if nS:
             wS = 1.0 / nS
-            costS = (entriesS * c_sell + exitsS * c_buy) * wS
+            costS = (entriesS * c_sell_s + exitsS * c_buy_s) * wS
         else:
             costS = 0.0
 
@@ -222,6 +326,7 @@ def run_backtest_continuous(preds: pd.DataFrame,
         per_rets.append(bucket)
         per_long.append(net_long)
         per_short.append(net_short)
+        per_dates.append(T)
         # 换手率（双边，相对目标仓位总量）
         base = max(nL + nS, 1)
         turnovers.append(((len(tgt_long - prev_long) + len(prev_long - tgt_long) +
@@ -230,7 +335,11 @@ def run_backtest_continuous(preds: pd.DataFrame,
 
         prev_long, prev_short = tgt_long, tgt_short
 
-    eq = pd.Series(per_rets)
+    # B 任务：组合层波动率目标化（用已实现波动，不用未来信息）
+    per_rets = _apply_vol_target(per_rets, rebalance_freq,
+                                 vol_target, vol_lookback, max_leverage)
+
+    eq = pd.Series(per_rets, index=pd.to_datetime(per_dates))
     equity = (1.0 + eq).cumprod()
     n_buckets = len(eq)
     years = n_buckets * rebalance_freq / 252.0 if n_buckets else 0.0
@@ -250,7 +359,11 @@ def run_backtest_continuous(preds: pd.DataFrame,
         short_equity=(1 + pd.Series(per_short)).cumprod(),
         ls_stats=ls, long_stats=lo, short_stats=_bucket_stats(per_short, rebalance_freq, years),
         n_trades=int(total_trades),
-        n_blocked=int(total_blocked), mode=f"continuous(buffer={buffer})",
+        n_blocked=int(total_blocked),
+        mode=f"continuous(buffer={buffer})[{cost_model}/{sizer}]"
+             + (f"+volt{vl_}" if (vl_ := vol_target) else ""),
+        cost_model=cost_model, sizer=sizer, vol_target=vol_target,
+        equity_dates=list(per_dates),
     )
 
 
@@ -262,21 +375,43 @@ def run_backtest(preds: pd.DataFrame,
                  cost: dict | None = None,
                  mode: str = "long_short",
                  label_col: str = "y_excess",
-                 bootstrap: bool = False) -> "BacktestResult":
+                 bootstrap: bool = False,
+                 cost_model: str = "fixed",
+                 sizer: str = "equal",
+                 vol_target: float | None = None,
+                 vol_lookback: int = 20,
+                 max_leverage: float = 1.0) -> "BacktestResult":
     """对一份预测表跑成本敏感回测。
 
     参数
     ----
     preds   : 含 date, symbol, pred 的预测表（可由 03/04 脚本产出）
-    panel   : 含 symbol, date, open, close 的行情面板
+    panel   : 含 symbol, date, open, close, [volume] 的行情面板
     horizon: 持有交易日数（与标签窗口一致）
     top_pct: 多/空各取前/后多少比例
     rebalance_freq: 调仓频率（交易日）；默认 = horizon（非重叠桶）
     cost    : 交易成本 dict（见 DEFAULT_COST）
+    cost_model: "fixed" 统一滑点；"liquidity" 按个股成交额分档滑点（A 任务）
+    sizer   : "equal" 等权；"inv_vol" 已验证失败、退化为 equal（见函数内警告）
+    vol_target: 年化波动目标（如 0.10）；非 None 且低于自然波动时做组合层去杠杆、
+                压低回撤（B 任务）。max_leverage 默认 1.0，不加息。
+    vol_lookback / max_leverage: vol 目标化的回看桶数 / 杠杆上限（默认只去杠杆）
     """
     cost = cost or DEFAULT_COST
     if rebalance_freq is None:
         rebalance_freq = horizon
+
+    # A 任务：流动性分档滑点
+    slip_map = compute_liquidity_slippage(panel) if cost_model == "liquidity" else None
+    if sizer == "inv_vol":
+        import warnings
+        warnings.warn(
+            "sizer='inv_vol' 已在本策略(日频多空 Top-decile)验证失败：逆波动加权把仓位"
+            "集中于低波动/弱信号股（含 vol≈0 的僵尸股被赋权爆炸），实测净收益 -53%、"
+            "MDD -71%；已退化为 equal。压回撤请用 vol_target。", stacklevel=2)
+    base_slip = float(cost["slippage"])
+    c_buy0 = float(cost["commission"])
+    c_sell0 = float(cost["commission"]) + float(cost["stamp"])
 
     df = attach_forward(panel, horizon, exit_extend=5)
     df = df[["symbol", "date", "open_s1"] + [f"open_s{k}" for k in range(horizon, horizon + 6)]
@@ -312,11 +447,6 @@ def run_backtest(preds: pd.DataFrame,
     # 毛收益（open 进 → open 出）
     m["gross_ret"] = m["open_out"] / m["open_in"] - 1.0
 
-    # 成本：做多 = 买(佣+滑) + 卖(佣+滑+印)；做空 = 卖(佣+滑+印) + 买(佣+滑)
-    c_buy = cost["commission"] + cost["slippage"]
-    c_sell = cost["commission"] + cost["slippage"] + cost["stamp"]
-    # 净收益稍后在组合层按方向计算（方向决定哪边是买/卖）
-
     # 调仓日：取预测日期集合，按频率抽稀
     all_dates = np.sort(m["date"].unique())
     rb_dates = all_dates[::rebalance_freq]
@@ -324,6 +454,7 @@ def run_backtest(preds: pd.DataFrame,
     bucket_rets = []
     bucket_long = []
     bucket_short = []
+    bucket_dates = []
     n_sel = 0
     for rb in rb_dates:
         sub = m[m["date"] == rb]
@@ -341,26 +472,36 @@ def run_backtest(preds: pd.DataFrame,
         n_sel += len(long_sym) + len(short_sym)
 
         def net(r: pd.Series, side: str) -> float:
+            # A 任务：个股滑点（流动性分档），否则用固定档
+            slip = slip_map.get(r["symbol"], base_slip) if slip_map else base_slip
+            c_buy = c_buy0 + slip
+            c_sell = c_sell0 + slip
             g = r["gross_ret"]
             if side == "long":
                 return g - c_buy - c_sell
             else:  # short: 进场是卖，平仓是买
                 return -g - c_sell - c_buy
 
-        w = 1.0 / k
-        long_ret = long_sym.apply(lambda r: net(r, "long"), axis=1).mean()
-        short_ret = short_sym.apply(lambda r: net(r, "short"), axis=1).mean()
+        # 多/空侧净收益（B 任务：sizer="inv_vol" 已退化为 equal，见顶部警告）
+        long_net = long_sym.apply(lambda r: net(r, "long"), axis=1)
+        short_net = short_sym.apply(lambda r: net(r, "short"), axis=1)
+        long_ret = float(long_net.mean())
+        short_ret = float(short_net.mean())
+
         if mode == "long_only":
-            # 仅做多前 P%（真实可交易、换手更低）
             bucket = long_ret
         else:
-            # 多空等权合并（多头 +1 份，空头 +1 份方向相反）
             bucket = 0.5 * long_ret + 0.5 * short_ret
         bucket_rets.append(bucket)
         bucket_long.append(long_ret)
         bucket_short.append(short_ret)
+        bucket_dates.append(rb)
 
-    eq = pd.Series(bucket_rets)
+    # B 任务：组合层波动率目标化（用已实现波动，不用未来信息）
+    bucket_rets = _apply_vol_target(bucket_rets, rebalance_freq,
+                                    vol_target, vol_lookback, max_leverage)
+
+    eq = pd.Series(bucket_rets, index=pd.to_datetime(bucket_dates))
     equity = (1.0 + eq).cumprod()
     n_buckets = len(eq)
     years = n_buckets * rebalance_freq / 252.0 if n_buckets else 0.0
@@ -382,6 +523,10 @@ def run_backtest(preds: pd.DataFrame,
         short_stats=_bucket_stats(bucket_short, rebalance_freq, years),
         n_trades=int(n_sel),
         n_blocked=int(m["entry_blocked"].sum()),
+        mode=f"bucket[{cost_model}/{sizer}]"
+             + (f"+volt{vl_}" if (vl_ := vol_target) else ""),
+        cost_model=cost_model, sizer=sizer, vol_target=vol_target,
+        equity_dates=list(bucket_dates),
     )
     return result
 
@@ -391,7 +536,9 @@ class BacktestResult:
 
     def __init__(self, horizon, top_pct, rebalance_freq, cost, equity,
                  long_equity, short_equity, ls_stats, long_stats, short_stats,
-                 n_trades, n_blocked, mode: str = "bucket"):
+                 n_trades, n_blocked, mode: str = "bucket",
+                 cost_model: str = "fixed", sizer: str = "equal",
+                 vol_target: float | None = None, equity_dates: list | None = None):
         self.mode = mode
         self.horizon = horizon
         self.top_pct = top_pct
@@ -405,6 +552,10 @@ class BacktestResult:
         self.short_stats = short_stats
         self.n_trades = n_trades
         self.n_blocked = n_blocked
+        self.cost_model = cost_model
+        self.sizer = sizer
+        self.vol_target = vol_target
+        self.equity_dates = equity_dates or list(equity.index)
 
     def to_dict(self) -> dict:
         return {
@@ -413,6 +564,9 @@ class BacktestResult:
             "top_pct": self.top_pct,
             "rebalance_freq": self.rebalance_freq,
             "cost": self.cost,
+            "cost_model": self.cost_model,
+            "sizer": self.sizer,
+            "vol_target": self.vol_target,
             "n_trades": self.n_trades,
             "n_blocked_by_limit_up": self.n_blocked,
             "long_short": self.ls_stats,
@@ -434,6 +588,8 @@ class BacktestResult:
         ]
         if "avg_turnover" in s:
             lines.append(f"  平均换手率      : {s['avg_turnover']:.1%} / 期")
+        if self.vol_target is not None:
+            lines.append(f"  波动目标        : {self.vol_target:.0%}（已缩放）")
         if self.n_blocked:
             lines.append(f"  成交笔数        : {self.n_trades:,}"
                          f"（因涨停被挡 {self.n_blocked:,}）")

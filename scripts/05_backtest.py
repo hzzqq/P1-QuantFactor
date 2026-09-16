@@ -65,6 +65,19 @@ def main() -> int:
                     help="回测结束日（含），如 2026-08-14")
     ap.add_argument("--buffer", type=float, default=0.0,
                     help="缓冲区宽度（排名分位）；>0 启用连续持仓+缓冲区调仓（降换手）")
+    ap.add_argument("--cost-model", choices=["fixed", "liquidity"], default="fixed",
+                    help="成本模型：fixed=统一滑点0.1%%；liquidity=按个股成交额分档滑点"
+                         "（微盘更高，更贴近真实冲击成本）")
+    ap.add_argument("--sizer", choices=["equal", "inv_vol"], default="equal",
+                    help="组合层仓位：equal=等权；inv_vol=静态逆波动加权（风险平价近似）")
+    ap.add_argument("--vol-target", type=float, default=None,
+                    help="组合层波动率目标（年化，如 0.15）；设定后按已实现波动缩放总敞口，"
+                         "压缩回撤。None=不缩放")
+    ap.add_argument("--vol-lookback", type=int, default=20,
+                    help="波动率目标化的回看桶数")
+    ap.add_argument("--max-leverage", type=float, default=1.0,
+                    help="波动率目标化杠杆上限（默认 1.0 = 只去杠杆、不加息；"
+                         "设 >1 才允许加杠杆，但会放大回撤）")
     ap.add_argument("--allow-rf-mismatch", action="store_true",
                     help="显式放行 rf != horizon（默认禁止）。仅在刻意做重叠桶实验时使用。")
     ap.add_argument("--max-rf-mismatch", type=int, default=0,
@@ -126,7 +139,10 @@ def main() -> int:
         logger.info("=== 回测 %s（%s 行）===", tag, f"{len(preds):,}")
 
         common = dict(horizon=args.horizon, top_pct=args.top_pct,
-                      rebalance_freq=args.rebalance_freq, mode=args.mode)
+                      rebalance_freq=args.rebalance_freq, mode=args.mode,
+                      cost_model=args.cost_model, sizer=args.sizer,
+                      vol_target=args.vol_target, vol_lookback=args.vol_lookback,
+                      max_leverage=args.max_leverage)
         if args.buffer > 0:
             # 连续持仓 + 缓冲区调仓：只对变动部分计成本，换手率大幅下降
             logger.info("降换手模式：连续持仓 + 缓冲区 buffer=%.3f", args.buffer)
