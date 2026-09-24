@@ -35,6 +35,7 @@ from shared.logging_utils import get_logger      # noqa: E402
 from src.eval import metrics                     # noqa: E402
 from src.models import dataset as ds_mod         # noqa: E402
 from src.models import gru_attn                  # noqa: E402
+from src.models import transformer_signal        # noqa: E402
 from src.models import trainer                   # noqa: E402
 
 logger = get_logger("P1.train_nn")
@@ -58,7 +59,7 @@ def main() -> int:
                         help="参与训练的股票数上限，0=全部")
     parser.add_argument("--train-years", type=int, default=3)
     parser.add_argument("--test-years", type=int, nargs="*", default=None)
-    parser.add_argument("--model", default="gru", choices=["gru", "tcn"])
+    parser.add_argument("--model", default="gru", choices=["gru", "tcn", "transformer"])
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--label-clip", type=float, default=0.5,
                         help="剔除 |超额收益| 超过该值的样本（异常复权/停牌复牌）")
@@ -138,6 +139,10 @@ def main() -> int:
         if args.model == "gru":
             model = gru_attn.GRUAttention(n_f, hidden=args.hidden,
                                           n_layers=args.layers)
+        elif args.model == "transformer":
+            model = transformer_signal.TransformerSignal(
+                n_f, hidden=args.hidden, n_layers=args.layers,
+                n_heads=4, dim_feedforward=256, dropout=0.2)
         else:
             model = gru_attn.TCN(n_f)
 
@@ -145,11 +150,12 @@ def main() -> int:
             model, train_ds, valid_ds, epochs=args.epochs,
             batch_size=args.batch_size, lr=args.lr, patience=4,
             num_threads=args.threads, seed=seed,
+            checkpoint_path=str(MODELS_DIR / f"{args.model}_ckpt_h{horizon}_{y}.pt"),
         )
 
         # 保存该年最佳模型权重，供 P5 导出 ONNX / 部署（待办：对接 P5）
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
-        ckpt = MODELS_DIR / f"gru_best_h{horizon}_{y}.pt"
+        ckpt = MODELS_DIR / f"{args.model}_best_h{horizon}_{y}.pt"
         torch.save(model.state_dict(), ckpt)
         logger.info("模型权重已保存: %s", ckpt)
 
