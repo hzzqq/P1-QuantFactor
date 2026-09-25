@@ -36,6 +36,7 @@ from src.eval import metrics                     # noqa: E402
 from src.models import dataset as ds_mod         # noqa: E402
 from src.models import gru_attn                  # noqa: E402
 from src.models import transformer_signal        # noqa: E402
+from src.models import gnn_signal              # noqa: E402
 from src.models import trainer                   # noqa: E402
 
 logger = get_logger("P1.train_nn")
@@ -59,7 +60,7 @@ def main() -> int:
                         help="参与训练的股票数上限，0=全部")
     parser.add_argument("--train-years", type=int, default=3)
     parser.add_argument("--test-years", type=int, nargs="*", default=None)
-    parser.add_argument("--model", default="gru", choices=["gru", "tcn", "transformer"])
+    parser.add_argument("--model", default="gru", choices=["gru", "tcn", "transformer", "gnn"])
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--label-clip", type=float, default=0.5,
                         help="剔除 |超额收益| 超过该值的样本（异常复权/停牌复牌）")
@@ -143,6 +144,11 @@ def main() -> int:
             model = transformer_signal.TransformerSignal(
                 n_f, hidden=args.hidden, n_layers=args.layers,
                 n_heads=4, dim_feedforward=256, dropout=0.2)
+        elif args.model == "gnn":
+            adj = gnn_signal.build_factor_graph(X3d, tr_m, n_f, threshold=0.3)
+            model = gnn_signal.FactorGraphGCN(
+                n_f, hidden=args.hidden, n_layers=args.layers,
+                gnn_layers=2, gnn_hidden=64, dropout=0.2, adj=adj)
         else:
             model = gru_attn.TCN(n_f)
 
