@@ -121,3 +121,86 @@ class FactorGraphGCN(nn.Module):
         if return_attn:
             return y, w.squeeze(-1)
         return y
+
+
+class FactorGraphGCNv2(nn.Module):
+    """v2（T-265 C 路）：双流门控 + richer 节点特征，修 v1 的结构性缺陷。
+
+    v1 病因（37_gnn_compare 实测 IC=0.0076，仅基线 1/5）：
+      GCN 因子均值池化**替换**了 GRU 的输入——原始 38 因子的逐因子判别信息
+      在进入时序编码器前被图聚合平滑掉。v1 是「GRU 吃图聚合向量」而非
+      「GRU 吃原始因子 + 图交互增广」。
+
+    v2 结构（保底 + 增益候选）：
+      主流：原始因子 (B,T,F) 直进 GRU（与 GRUAttention 完全同构，保底下界）；
+      辅流：GCN 因子交互特征——节点特征从单因子标量升维 (x_t, Δx5_t)
+            （因子值 + 5 日变化，richer 输入），消息传递后均值池化，
+            再经轻量 GRU 编码 (B,T,hidden)；
+      融合：h = h_main + gate·h_aux，gate 为零初始化可学习标量
+            → **训练起点严格等价 GRUAttention 基线**；图交互学到信息 gate
+            才非零，学不到则退化为基线（不会更差）。
+    接口与 GRUAttention / FactorGraphGCN 一致（head-to-head 公平）。
+    """
+
+    def __init__(self, n_features: int, hidden: int = 64, n_layers: int = 2,
+                 gnn_layers: int = 2, gnn_hidden: int = 64, dropout: float = 0.2,
+                 adj: np.ndarray | None = None):
+        super().__init__()
+        self.n_features = n_features
+        self.hidden = hidden
+        self.input_norm = nn.LayerNorm(n_features)
+        # ── 主流：原始因子直进 GRU（保底）──
+        self.gru_main = nn.GRU(n_features, hidden, n_layers, batch_first=True,
+                               dropout=dropout if n_layers > 1 else 0.0)
+        # ── 辅流：GCN 因子交互（richer 节点特征 = (x_t, Δx5_t)）──
+        self.factor_proj = nn.Linear(2, gnn_hidden)
+        self.gnn_layers = nn.ModuleList(
+            [nn.Linear(gnn_hidden, gnn_hidden) for _ in range(gnn_layers)])
+        self.gnn_act = nn.ReLU()
+        self.gnn_drop = nn.Dropout(dropout)
+        self.gru_aux = nn.GRU(gnn_hidden, hidden, num_layers=1, batch_first=True)
+        # ── 门控融合：零初始化 → 起点=基线 ──
+        self.gate = nn.Parameter(torch.zeros(1))
+        self.attn = nn.Sequential(
+            nn.Linear(hidden, 32), nn.Tanh(), nn.Linear(32, 1, bias=False))
+        self.head = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, 1))
+        if adj is not None:
+            self.register_buffer("adj", torch.as_tensor(np.asarray(adj, np.float32)))
+        else:
+            self.adj = None
+
+    def set_graph(self, adj: np.ndarray) -> None:
+        self.register_buffer("adj", torch.as_tensor(np.asarray(adj, np.float32)))
+
+    def _delta5(self, x: torch.Tensor) -> torch.Tensor:
+        """5 日变化 Δx5：时间步 shift（前 5 步补 0），(B,T,F)。"""
+        dx = torch.zeros_like(x)
+        dx[:, 5:, :] = x[:, 5:, :] - x[:, :-5, :]
+        return dx
+
+    def _gcn_pool(self, x: torch.Tensor) -> torch.Tensor:
+        """因子维消息传递 + 均值池化：x (B,T,F) → (B,T,gnn_hidden)。"""
+        b, t, f = x.shape
+        node = torch.stack([x, self._delta5(x)], dim=-1)   # (B, T, F, 2) richer 节点特征
+        h = self.factor_proj(node)                          # (B, T, F, gnn_hidden)
+        h = h.reshape(b * t, f, -1)
+        for lin in self.gnn_layers:
+            msg = torch.einsum("ij,njd->nid", self.adj, h)  # A @ H
+            h = self.gnn_act(lin(msg))
+            h = self.gnn_drop(h)
+        return h.reshape(b, t, f, -1).mean(dim=2)           # (B, T, gnn_hidden)
+
+    def forward(self, x: torch.Tensor, return_attn: bool = False):
+        if self.adj is None:
+            raise RuntimeError("FactorGraphGCNv2: 必须先 set_graph(adj) 或构造时传入 adj")
+        xn = self.input_norm(x)
+        out_main, _ = self.gru_main(xn)                     # (B, T, hidden) 保底主流
+        h_aux = self._gcn_pool(xn)                          # (B, T, gnn_hidden)
+        out_aux, _ = self.gru_aux(h_aux)                    # (B, T, hidden)
+        out = out_main + torch.tanh(self.gate) * out_aux    # 门控残差融合
+        w = torch.softmax(self.attn(out), dim=1)
+        ctx = (out * w).sum(dim=1)
+        y = self.head(ctx).squeeze(-1)
+        if return_attn:
+            return y, w.squeeze(-1)
+        return y

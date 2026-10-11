@@ -60,7 +60,9 @@ def main() -> int:
                         help="参与训练的股票数上限，0=全部")
     parser.add_argument("--train-years", type=int, default=3)
     parser.add_argument("--test-years", type=int, nargs="*", default=None)
-    parser.add_argument("--model", default="gru", choices=["gru", "tcn", "transformer", "gnn"])
+    parser.add_argument("--model", default="gru", choices=["gru", "tcn", "transformer", "gnn", "gnn_gate"])
+    parser.add_argument("--tag", default="",
+                        help="输出文件名后缀（T-265：report/out 防覆盖，如 h96l3）")
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--label-clip", type=float, default=0.5,
                         help="剔除 |超额收益| 超过该值的样本（异常复权/停牌复牌）")
@@ -149,6 +151,13 @@ def main() -> int:
             model = gnn_signal.FactorGraphGCN(
                 n_f, hidden=args.hidden, n_layers=args.layers,
                 gnn_layers=2, gnn_hidden=64, dropout=0.2, adj=adj)
+        elif args.model == "gnn_gate":
+            # T-265 C 路：双流门控 v2（主流原始因子直进 GRU 保底 + 辅流 GCN 交互，
+            # gate 零初始化 → 起点等价 GRUAttention；修 v1「GCN 池化替换 GRU 输入」缺陷）
+            adj = gnn_signal.build_factor_graph(X3d, tr_m, n_f, threshold=0.3)
+            model = gnn_signal.FactorGraphGCNv2(
+                n_f, hidden=args.hidden, n_layers=args.layers,
+                gnn_layers=2, gnn_hidden=64, dropout=0.2, adj=adj)
         else:
             model = gru_attn.TCN(n_f)
 
@@ -206,7 +215,8 @@ def main() -> int:
     print("=" * 62 + "\n")
 
     PROCESSED.mkdir(parents=True, exist_ok=True)
-    out_name = args.out or f"pred_{args.model}_h{horizon}.parquet"
+    _tag = f"_{args.tag}" if args.tag else ""
+    out_name = args.out or f"pred_{args.model}_h{horizon}{_tag}.parquet"
     preds.to_parquet(PROCESSED / out_name, index=False)
 
     report = {
@@ -217,7 +227,7 @@ def main() -> int:
         "quantile_returns": qr.reset_index().to_dict(orient="records"),
         "elapsed_sec": round(time.time() - t0, 1),
     }
-    rp = PROCESSED / f"report_{args.model}_h{horizon}.json"
+    rp = PROCESSED / f"report_{args.model}_h{horizon}{_tag}.json"
     with rp.open("w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2, default=str)
 
