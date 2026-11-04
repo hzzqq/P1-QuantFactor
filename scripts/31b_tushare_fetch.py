@@ -89,15 +89,27 @@ def _to_symbol(ts_code: str) -> str:
 
 
 def _map_chunk(df: pd.DataFrame) -> pd.DataFrame:
+    """列容错映射：tushare 低档账号会**静默丢弃无权限字段**（如 vol/pe/pb/float_share），
+    只返回基础列。这里拿到什么映射什么，缺失列填 NaN，下游 32 的 dropna/覆盖率护栏会处理。
+    `turnover_rate`（换手率）是主目标字段，缺失则整行 symbol/date 为 NaN、在 _combine 被丢弃。"""
+    n = len(df)
+    def _col(name, dtype):
+        if name in df.columns:
+            return pd.to_numeric(df[name], errors="coerce").astype(dtype)
+        return pd.Series([np.nan] * n, dtype=dtype)
+    symbol = (df["ts_code"].map(_to_symbol).astype(str)
+              if "ts_code" in df.columns else pd.Series([np.nan] * n))
+    date = (pd.to_datetime(df["trade_date"], format="%Y%m%d")
+            if "trade_date" in df.columns else pd.Series([pd.NaT] * n))
     out = pd.DataFrame({
-        "symbol": df["ts_code"].map(_to_symbol).astype(str),
-        "date": pd.to_datetime(df["trade_date"], format="%Y%m%d"),
-        "close": pd.to_numeric(df["close"], errors="coerce").astype(np.float32),
-        "volume": pd.to_numeric(df["vol"], errors="coerce").astype(np.float32),
-        "turn": pd.to_numeric(df["turnover_rate"], errors="coerce").astype(np.float32),
-        "float_share": pd.to_numeric(df["float_share"], errors="coerce").astype(np.float64),
-        "peTTM": pd.to_numeric(df["pe"], errors="coerce").astype(np.float32),
-        "pbMRQ": pd.to_numeric(df["pb"], errors="coerce").astype(np.float32),
+        "symbol": symbol,
+        "date": date,
+        "close": _col("close", np.float32),
+        "volume": _col("vol", np.float32),
+        "turn": _col("turnover_rate", np.float32),
+        "float_share": _col("float_share", np.float64),
+        "peTTM": _col("pe", np.float32),
+        "pbMRQ": _col("pb", np.float32),
     })
     return out
 
