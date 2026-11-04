@@ -13,16 +13,27 @@
 
 token 从环境变量 TUSHARE_TOKEN 读取（**绝不落盘 / 不提交**）。
 
+⚠️ 积分门槛（2026-11-04 官方文档 doc_id=108 / doc_id=290 核实 + 实测）：
+    `daily_basic`（换手率/流通股本）最低分值 **2000**，不是 120！
+      - 120 积分（免费）：50次/分，但**只能调 daily 等非复权日线，其他接口无权调取**；
+        实测 daily_basic 被降级到 **1次/小时**（不是临时惩罚，等多久都不会恢复）。
+      - 2000 积分（¥200/年）：200次/分；5000 积分（¥500/年）：500次/分。
+    → 免费档在本脚本上**不可行**（1492 只 × 1小时 ≈ 62 天）。要跑全量必须 ≥2000 积分。
+    → 判别方法：同 token 调 daily 成功 / daily_basic 报 1次/小时 = 积分门槛，而非账号惩罚。
+
 健壮性（吸取 baostock 教训）：
-    - 每交易日一次调用，主循环 sleep 限流（默认 0.3s，约 200 调用/分，远低于 tushare 上限）。
+    - 主循环 sleep 限流，默认 65s（低档 1次/分钟 留余量）；高积分档可传 --sleep 0.3 提到 ~200调用/分。
     - 单次调用套**线程级超时**（默认 30s）+ 重试 3 次，避免任何后端挂死拖垮整轮。
-    - **断点续跑**：每交易日结果落盘为 tmp/{trade_date}.parquet，重启自动跳过已完成的日期。
+    - **断点续跑**：每单元结果落盘为 tmp/{unit}.parquet，重启自动跳过已完成单元。
+    - **自适应限速**：命中限流自动按「1次/分钟→80s」「1次/小时→3620s」退避；成功后
+      gap 复位到基础间隔（防惩罚遗留大间隔拖慢全量）；若 1次/小时 退避一次后重试仍命中，
+      则整体放弃（防逐单元 3620s 爬死）。
     - --dry：只拉 1 个交易日验证 token + 列结构，不拉全量。
 
 用法：
     export TUSHARE_TOKEN=你的token
-    python scripts/31b_tushare_fetch.py --mode stock --start 2015-01-27 --end 2026-08-14
     python scripts/31b_tushare_fetch.py --dry                 # 连通性 + 列校验
+    python scripts/31b_tushare_fetch.py --mode stock --start 2015-01-27 --end 2026-08-14 --sleep 0.3  # ≥2000积分 全量
     python scripts/31b_tushare_fetch.py --mode stock --start 2015-01-27 --end 2026-08-14 --max-symbols 50  # 抽样验证用
     python scripts/31b_tushare_fetch.py --mode date --start 2023-01-01 --end 2026-08-14 --max-dates 800    # 仅高积分账号
 """
@@ -151,7 +162,7 @@ def _run_units(pro, units, tmp: Path, call_fn, sleep: float, label: str):
             skip += 1
             continue
         ok = False
-        for _ in range(RETRY):
+        for attempt in range(RETRY):
             wait = max(0.0, next_call - time.time())
             if wait > 0:
                 time.sleep(wait)
@@ -163,6 +174,11 @@ def _run_units(pro, units, tmp: Path, call_fn, sleep: float, label: str):
                 if g:
                     gap = g + 20.0  # 留 20s 余量
                     print(f"    [RATELIMIT {u}] {msg[:70]} → 退避 {gap:.0f}s", flush=True)
+                    if g >= 3600.0 and attempt > 0:
+                        # 1次/小时 重试仍命中 → 账户持续节流（资料/积分未生效或仍在惩罚态），
+                        # 全量拉取不可行，整体放弃，避免逐单元 3620s 爬死。
+                        print(f"    [ABORT] 持续 1次/小时 节流，账户频率未达预期，终止全量拉取", flush=True)
+                        return done, skip, fail
                     next_call = now + gap
                     time.sleep(gap)
                     continue
@@ -179,7 +195,8 @@ def _run_units(pro, units, tmp: Path, call_fn, sleep: float, label: str):
                 time.sleep(3)
                 continue
             ok = True
-            next_call = now + gap  # 成功后，下一单元至少间隔 gap
+            gap = sleep  # 成功即说明在限额内，恢复基础间隔（避免惩罚遗留的大 gap 拖慢全量）
+            next_call = now + gap
             break
         if ok:
             done += 1
@@ -266,7 +283,9 @@ def main() -> int:
     ap.add_argument("--start", default="2015-01-27")
     ap.add_argument("--end", default="2026-08-14")
     ap.add_argument("--sleep", type=float, default=65.0,
-                     help="调用间隔秒数；免费/低积分账号 daily_basic 限 1次/分钟，默认 65s 以留余量")
+                     help="调用间隔秒数；默认 65s（低档 1次/分钟 留余量）。"
+                          "注意 daily_basic 需 ≥2000 积分：120 分免费档无权调取，会被限到 1次/小时；"
+                          "2000 分档可传 0.3（~200调用/分）")
     ap.add_argument("--max-dates", type=int, default=None)
     ap.add_argument("--max-symbols", type=int, default=None,
                      help="按股票模式下的抽样只数；不传则全量 1427 只")
