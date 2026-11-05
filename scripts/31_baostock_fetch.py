@@ -76,6 +76,7 @@ BATCH_N = 100  # 每片约 100 只，前台可控
 QUERY_TIMEOUT = 30  # 单只股票查询线程超时(s)，防 baostock 无 timeout 挂死
 MAX_RETRIES = 3     # 单只失败重试次数
 RETRY_BACKOFF = 2.0  # 重试间隔(s)
+REPAIR_ROUNDS = 3    # 主轮后补拉失败标的的轮数（网络错误 10002007 是瞬时的，会连片出现）
 
 
 def to_bs_code(symbol: str) -> str:
@@ -92,16 +93,22 @@ def load_symbols() -> list[str]:
     return syms
 
 
-def _query_one_symbol(bs, bs_code: str, timeout: float = 30) -> list | None:
+def _query_one_symbol(bs, bs_code: str, timeout: float = 30,
+                       start_date: str = "2010-01-01", end_date: str = "2026-12-31") -> list | None:
     """在独立线程执行单只股票查询，带超时保护（baostock 自身无 timeout）。
-    返回 rows（list of row_data）；超时/查询错误/异常均返回 None。"""
+    返回 rows（list of row_data）；超时/查询错误/异常均返回 None。
+
+    start_date/end_date 可调：**查询区间长度直接决定单只耗时**（实测 2026-11-05）：
+        2010-01-01~2026-12-31 ≈ 6.5s/只（4087 行）
+        2015-01-27~2026-10-31 ≈ 2.8s/只（2856 行）
+    只覆盖目标数据集所需区间可显著提速（全量 1492 只：~2.7h → ~1.4h）。"""
     box: dict = {}
 
     def _worker() -> None:
         try:
             rs = bs.query_history_k_data_plus(
                 bs_code, FIELDS,
-                start_date="2010-01-01", end_date="2026-12-31",
+                start_date=start_date, end_date=end_date,
                 frequency="d", adjustflag="3",
             )
             if rs.error_code != "0":
@@ -164,7 +171,8 @@ def _login_with_timeout(bs, timeout: float = 30):
     return box.get("lg")
 
 
-def fetch_batch(symbols: list[str], sleep: float, partial_path: Path) -> pd.DataFrame:
+def fetch_batch(symbols: list[str], sleep: float, partial_path: Path,
+                start_date: str = "2010-01-01", end_date: str = "2026-12-31") -> pd.DataFrame:
     """拉取一批 symbol。每只查询带 30s 线程超时 + 3 次重试；每 25 只增量落盘 .partial。
     支持断点续跑：若 partial 已存在，跳过其中已完成的 symbol，只补拉剩余。
     返回最终 DataFrame（调用方负责写最终 parquet）。"""
@@ -186,13 +194,15 @@ def fetch_batch(symbols: list[str], sleep: float, partial_path: Path) -> pd.Data
         print(f"  [RESUME] 从 partial 续跑，已完成 {len(done_symbols)} 只，补拉剩余",
               flush=True)
     t0 = time.time()
+    failed: list[str] = []
     for i, code in enumerate(symbols):
         if code in done_symbols:
             continue  # 跳过已完成
         bs_code = to_bs_code(code)
         sym_rows = None
         for attempt in range(1, MAX_RETRIES + 1):
-            sym_rows = _query_one_symbol(bs, bs_code, timeout=QUERY_TIMEOUT)
+            sym_rows = _query_one_symbol(bs, bs_code, timeout=QUERY_TIMEOUT,
+                                         start_date=start_date, end_date=end_date)
             if sym_rows is not None:
                 break
             if attempt < MAX_RETRIES:
@@ -203,12 +213,43 @@ def fetch_batch(symbols: list[str], sleep: float, partial_path: Path) -> pd.Data
             acc = pd.concat([acc, _build_df(sym_rows)], ignore_index=True)
         else:
             print(f"    [FAIL] {code} 重试{MAX_RETRIES}次仍失败，跳过", flush=True)
+            failed.append(code)
         if sleep > 0:
             time.sleep(sleep)
         if (i + 1) % 25 == 0:
             acc.to_parquet(partial_path, index=False)  # 增量落盘防丢失
             print(f"  processed {i+1}/{len(symbols)} symbols, {len(acc)} rows, "
                   f"{time.time()-t0:.0f}s [增量落盘]", flush=True)
+
+    # ---- 修复轮：网络类错误(10002007 接收数据异常)是**瞬时**的，实测会连片出现 ----
+    # 主轮失败的 symbol 若直接丢弃，final parquet 会**静默缺标的** → 覆盖率虚高、
+    # 下游误以为全量（2026-11-05 实测 batch1 连挂 22 只）。故此处做多轮补拉。
+    for rnd in range(1, REPAIR_ROUNDS + 1):
+        if not failed:
+            break
+        print(f"  [REPAIR r{rnd}] 补拉 {len(failed)} 只失败标的（退避 {REPAIR_BACKOFF*3}s）",
+              flush=True)
+        time.sleep(REPAIR_BACKOFF * 3)
+        still: list[str] = []
+        for code in list(failed):
+            sym_rows = None
+            for attempt in range(1, MAX_RETRIES + 1):
+                sym_rows = _query_one_symbol(bs, to_bs_code(code), timeout=QUERY_TIMEOUT,
+                                             start_date=start_date, end_date=end_date)
+                if sym_rows is not None:
+                    break
+                time.sleep(REPAIR_BACKOFF)
+            if sym_rows:
+                acc = pd.concat([acc, _build_df(sym_rows)], ignore_index=True)
+            else:
+                still.append(code)
+        print(f"  [REPAIR r{rnd}] 成功 {len(failed)-len(still)} 只，仍失败 {len(still)} 只",
+              flush=True)
+        failed = still
+    if failed:
+        print(f"  [WARN] 本片仍有 {len(failed)} 只补拉未成功：{failed[:10]}"
+              f"{' ...' if len(failed) > 10 else ''}", flush=True)
+        acc.to_parquet(partial_path, index=False)  # 保留 partial，供下次续跑再补
     bs.logout()
     return acc
 
@@ -218,6 +259,12 @@ def main() -> int:
     ap.add_argument("--batch", type=int, default=0, help="当前片索引")
     ap.add_argument("--n-batches", type=int, default=15, help="总片数")
     ap.add_argument("--sleep", type=float, default=0.5, help="每只股票查询间隔(s)，默认0.5=120次/分限流")
+    ap.add_argument("--start", type=str, default="2010-01-01",
+                    help="查询起始日(YYYY-MM-DD)，默认 2010-01-01。"
+                         "区间长度直接决定单只耗时（实测 2026-11-05：2010起≈6.5s/只，"
+                         "2015起≈2.8s/只）。只覆盖目标数据集所需区间可显著提速。")
+    ap.add_argument("--end", type=str, default="2026-12-31",
+                    help="查询结束日(YYYY-MM-DD)，默认 2026-12-31（覆盖到未来无害）。")
     ap.add_argument("--combine", action="store_true", help="仅合并所有分片")
     args = ap.parse_args()
 
@@ -263,20 +310,41 @@ def main() -> int:
     out_path = OUTDIR / f"baostock_daily_batch_{args.batch:03d}.parquet"
     partial_path = OUTDIR / f"baostock_daily_batch_{args.batch:03d}.partial.parquet"
     if out_path.exists():
-        print(f"[31] 片 {args.batch} 已存在 {out_path.name}，跳过（删此文件可重跑）")
-        return 0
-    print(f"[31] 拉取片 {args.batch}/{args.n_batches}（{len(batch_syms)} 只）...", flush=True)
+        # 自愈：若上次因网络错误留下的 final **标的数不足**，说明它不是全量片，
+        # 删掉它并借 partial 续跑补齐（否则会静默当成完整片，coverage 虚高）。
+        try:
+            got = pd.read_parquet(out_path, columns=["symbol"])["symbol"].nunique()
+        except Exception:  # noqa: BLE001
+            got = 0
+        if got >= len(batch_syms):
+            print(f"[31] 片 {args.batch} 已存在 {out_path.name}（{got} 只），跳过"
+                  f"（删此文件可重跑）")
+            return 0
+        print(f"[31] 片 {args.batch} 已存在但仅 {got}/{len(batch_syms)} 只（上次网络错误），"
+              f"删除后借 partial 续跑补齐", flush=True)
+        _hard_delete(out_path)
+    print(f"[31] 拉取片 {args.batch}/{args.n_batches}（{len(batch_syms)} 只，"
+          f"区间 {args.start}~{args.end}）...", flush=True)
     t0 = time.time()
     try:
-        df = fetch_batch(batch_syms, args.sleep, partial_path)
+        df = fetch_batch(batch_syms, args.sleep, partial_path,
+                         start_date=args.start, end_date=args.end)
     except BaostockBanned as e:
         print(f"[31] BAOSTOCK_BANNED: {e}", flush=True)
         return 2
     df.to_parquet(out_path, index=False)
+    got = df["symbol"].nunique() if "symbol" in df.columns else 0
+    print(f"[31] 片 {args.batch} 完成：{len(df):,} 行，{got}/{len(batch_syms)} 只，"
+          f"{time.time()-t0:.0f}s → {out_path.name}", flush=True)
+    # 覆盖护栏：本片标的缺失会**静默**造成下游覆盖率虚高（2026-11-05 实测连片网络错误
+    # 导致 22 只被丢弃）。缺标的时**保留 partial**（含已成功的标的）并以非 0 退出，
+    # 上层删掉 final 后重跑本片即可只补缺失的那些。
+    if got < len(batch_syms):
+        print(f"[31] ⚠️ 片 {args.batch} 仅 {got}/{len(batch_syms)} 只，缺 "
+              f"{len(batch_syms)-got} 只（网络错误）；保留 partial 供续跑补齐", flush=True)
+        return 3
     if partial_path.exists():
         _hard_delete(partial_path)  # 清理增量临时文件（绕过 safe-delete shim）
-    print(f"[31] 片 {args.batch} 完成：{len(df):,} 行，{time.time()-t0:.0f}s → {out_path.name}",
-          flush=True)
     return 0
 
 

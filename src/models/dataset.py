@@ -23,17 +23,38 @@ from shared.logging_utils import get_logger
 logger = get_logger("P1.models.dataset")
 
 
+def slim_frame(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    """就地瘦身：数值列降 float32，逐列把 inf 置为 NaN。
+
+    与 `df.replace([inf,-inf], nan)` 语义一致，但避免一次性为整表申请
+    (n_rows × n_cols) 的 bool 掩码（2.9M 行 × 41 列约 113MB，内存紧张时
+    正是最先失败的那一笔）。逐列处理时掩码只有 2.9MB。
+    """
+    for c in cols:
+        if c not in df.columns:
+            continue
+        arr = df[c].to_numpy(dtype="float64", copy=True)
+        arr[~np.isfinite(arr)] = np.nan
+        df[c] = arr.astype("float32", copy=False)
+    return df
+
+
 def build_3d(data: pd.DataFrame, factor_names: list[str],
-             y_col: str = "y_excess") -> tuple[np.ndarray, np.ndarray,
-                                               np.ndarray, np.ndarray]:
+             y_col: str = "y_excess",
+             copy: bool = True) -> tuple[np.ndarray, np.ndarray,
+                                         np.ndarray, np.ndarray]:
     """把 long 数据转成三维数组。
+
+    Args:
+        copy: 默认 True（不改调用方数据）。传 False 时复用入参本身以省一份
+              整表副本（约 0.5~1GB），调用方须自行保证不再使用该 DataFrame。
 
     Returns:
         X3d : (n_symbols, n_dates, n_features) float32
         y3d : (n_symbols, n_dates) float32
         dates, symbols : 对应坐标轴
     """
-    df = data.copy()
+    df = data.copy() if copy else data
     df["date"] = pd.to_datetime(df["date"])
 
     dates = np.sort(df["date"].unique())

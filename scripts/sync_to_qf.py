@@ -42,6 +42,15 @@ SYNC_FILES = ["conftest.py", "README.md", ".gitignore"]
 
 SKIP_DIR_NAMES = {"__pycache__", ".pytest_cache", ".ipynb_checkpoints"}
 SKIP_SUFFIXES = {".pyc", ".pyo", ".log", ".parquet", ".pt", ".onnx", ".csv"}
+# 备份文件（`foo.py.bak_20261105` / `foo.py.bak`）不是受管源码：
+# 它的 `suffix` 是 `.bak_20261105`（不是 `.py`），会漏过 SKIP_SUFFIXES 而被当成
+# 「新增受管文件」同步进 _qf，既污染发布镜像又让 p1-sync 门禁误红。
+SKIP_NAME_MARKERS = (".bak", ".orig", ".rej", "~")
+
+
+def _is_skipped_backup(p: Path) -> bool:
+    name = p.name.lower()
+    return any(m in name for m in SKIP_NAME_MARKERS)
 
 
 def _iter_files(base: Path, rel: str):
@@ -58,6 +67,8 @@ def _iter_files(base: Path, rel: str):
         if any(part in SKIP_DIR_NAMES for part in p.parts):
             continue
         if p.suffix in SKIP_SUFFIXES:
+            continue
+        if _is_skipped_backup(p):
             continue
         yield p.relative_to(base)
 

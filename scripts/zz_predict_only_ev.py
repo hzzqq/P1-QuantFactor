@@ -68,13 +68,20 @@ def main() -> int:
     factor_names = json.load(open(meta_path, encoding="utf-8"))["factor_names"]
 
     data = pd.read_parquet(PROCESSED / f"dataset_h{HORIZON}_ev.parquet")
-    data = data.replace([np.inf, -np.inf], np.nan).dropna(subset=["y_excess"])
+    keep = [c for c in (list(factor_names) + ["date", "symbol", "y_excess"]) if c in data.columns]
+    if len(keep) < len(data.columns):
+        data = data[keep]
+    # 逐列降 float32 + inf 置 NaN（等价于原 replace/dropna，但不申请整表 bool 掩码）
+    ds_mod.slim_frame(data, list(factor_names) + ["y_excess"])
+    y_arr = data["y_excess"].to_numpy(dtype="float64", copy=False)
+    mask = np.isfinite(y_arr)
     if LABEL_CLIP > 0:
-        data = data[data["y_excess"].abs() <= LABEL_CLIP]
+        mask &= np.abs(y_arr) <= LABEL_CLIP
+    data = data.loc[mask]
     logger.info("EV 数据集 %s 行 | %s 只 | %s 因子",
                 f"{len(data):,}", data["symbol"].nunique(), len(factor_names))
 
-    X3d, y3d, dates, symbols = ds_mod.build_3d(data, factor_names)
+    X3d, y3d, dates, symbols = ds_mod.build_3d(data, factor_names, copy=False)
     del data
     gc.collect()
     n_f = X3d.shape[2]

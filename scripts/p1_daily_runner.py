@@ -32,9 +32,9 @@ def log(msg, hb=True):
             f.write(line + "\n")
 
 
-def run(script, *args, cwd=BASE, py=SJ_PY):
+def run(script, *args, cwd=BASE, py=SJ_PY, hb=True):
     cmd = [py, os.path.join(SCR, script)] + list(args) if os.path.sep not in script else [py, script] + list(args)
-    log(f"RUN {script} {' '.join(args)}")
+    log(f"RUN {script} {' '.join(args)}", hb=hb)
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     tail = (r.stdout or "").strip().splitlines()
     tail = tail[-3:] if tail else []
@@ -153,6 +153,9 @@ def main():
                 subprocess.run([SJ_PY, os.path.join(SCR, "06_export_signal.py"), "--model", "fusion"], capture_output=True, text=True)
                 import shutil
                 shutil.copy2(os.path.join(PD, "signals", "signal_fusion_h10.json"), os.path.join(KS_SIG, "signal_fusion_h10.json"))
+                # 融合信号是最后一批落盘的，必须重跑一致性校验：
+                # 之前只在融合导出前校验，会把当日的 fusion 旧日期误判成 INCONSISTENT
+                ok = copy_signals()
                 run("zz_paper_portfolio.py", "--top-k", "10", hb=False)
                 run("zz_paper_sensitivity.py", hb=False)
             log(f"CHAIN_DONE ok={ok}")

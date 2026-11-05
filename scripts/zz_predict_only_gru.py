@@ -65,15 +65,24 @@ def main() -> int:
 
     t0 = time.time()
     data = pd.read_parquet(PROCESSED / f"dataset_h{horizon}.parquet")
-    data = data.replace([np.inf, -np.inf], np.nan).dropna(subset=["y_excess"])
+    keep = [c for c in (list(factor_names) + ["date", "symbol", "y_excess"]) if c in data.columns]
+    if len(keep) < len(data.columns):
+        data = data[keep]
+    # 逐列降 float32 并把 inf 置 NaN：等价于原 replace([inf,-inf], nan)，
+    # 但不为整表申请 bool 掩码（内存紧张时那 113MB 就是压垮进程的一笔，2026-11-05 实测）
+    ds_mod.slim_frame(data, list(factor_names) + ["y_excess"])
+    y_arr = data["y_excess"].to_numpy(dtype="float64", copy=False)
+    mask = np.isfinite(y_arr)
     if args.label_clip > 0:
-        before = len(data)
-        data = data[data["y_excess"].abs() <= args.label_clip]
+        mask &= np.abs(y_arr) <= args.label_clip
+    before = len(data)
+    data = data.loc[mask]
+    if args.label_clip > 0:
         logger.info("标签截断: %s -> %s", f"{before:,}", f"{len(data):,}")
     logger.info("数据集 %s 行 | %s 只 | %s 因子",
                 f"{len(data):,}", data["symbol"].nunique(), len(factor_names))
 
-    X3d, y3d, dates, symbols = ds_mod.build_3d(data, factor_names)
+    X3d, y3d, dates, symbols = ds_mod.build_3d(data, factor_names, copy=False)
     del data
     gc.collect()
     n_f = X3d.shape[2]

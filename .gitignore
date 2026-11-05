@@ -1,9 +1,9 @@
+# 生成物 / 缓存
+logs/
+.pytest_cache/
 __pycache__/
 *.pyc
-.pytest_cache/
-logs/
-*.log
-data/
-models/*.bin
-models/*.pt
-.ipynb_checkpoints/
+_grid_run.log
+
+# 另一条线的工作区（明确避开，不纳入版本控制）
+.workbuddy/
