@@ -93,6 +93,38 @@ def main() -> int:
     print(f"[33b] 载入 {len(df):,} 行 | 日期 {df['date'].min().date()}~{df['date'].max().date()}"
           f" | 标的 {df['symbol'].nunique() if 'symbol' in df.columns else '?'} 只")
 
+    # ---------- 数据健全性前置门禁（2026-11-06 新增，只增不改）----------
+    # 背景：2026-09-07 建的 v40 里 turnover_daily / log_mktcap_real 来自 **baostock**，
+    # 而 baostock 的 turn 字段有严重填充值问题（实测：top-1 值 0.010838 占 **57.65%** 的行）。
+    # 若拿这种数据做残差 IC，结论必然是「残差 IC≈0 ⇒ 冗余不值得纳入」——但那是**数据坏了**，
+    # 不是因子性质，**属于假结论**。因此先做健全性检查，坏数据直接拒绝出结论。
+    bad = []
+    for nf in new_factors:
+        if nf not in df.columns:
+            continue
+        s = df[nf].dropna()
+        if len(s) == 0:
+            bad.append((nf, "全部缺失"))
+            continue
+        vc = s.value_counts()
+        top1 = float(vc.iloc[0]) / len(s)
+        nun = int(s.nunique())
+        if top1 > 0.20:
+            bad.append((nf, f"top-1 值占比 {top1*100:.1f}%（值={vc.index[0]!r}，unique={nun:,}）"))
+        else:
+            print(f"[33b] 健全性 OK  {nf}: top-1 占比 {top1*100:.3f}%, unique={nun:,}, "
+                  f"std={float(s.std()):.6g}")
+    if bad:
+        print("\n[33b] ❌ 数据健全性检查未通过 —— 拒绝出结论（避免坏数据产出假结论）：")
+        for nf, why in bad:
+            print(f"      {nf}: {why}")
+        src_desc = meta.get("added_source") or meta.get("added_factors") or "(未记录)"
+        print(f"      数据集构建来源: built_at={meta.get('built_at')} | {src_desc}")
+        print("      处理建议：这不是因子性质问题，是取数源问题。"
+              "请先用真实源（如 tushare daily_basic 的 turnover_rate）重建该因子，")
+        print("      或直接删除这些坏因子后重建 v40，再重跑本脚本。")
+        return 2
+
     # ---------- (1) pooled 相关 ----------
     print("\n=== (1) 新因子 vs 既有因子：pooled Pearson 相关（取 |r| 最大的 12 个）===")
     for nf in new_factors:
