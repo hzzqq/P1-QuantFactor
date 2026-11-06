@@ -39,11 +39,16 @@ from src.eval.metrics import daily_ic, ic_summary  # noqa: E402
 PROC = ROOT / "data" / "P1" / "processed"
 
 
-def _cs_residual(df: pd.DataFrame, target: str, feats: list[str]) -> pd.DataFrame:
+def _cs_residual(df: pd.DataFrame, target: str, feats: list[str],
+                 keep: list[str] | None = None) -> pd.DataFrame:
     """逐日横截面 OLS：target ~ 1 + feats，返回残差（未解释部分）。
 
     逐日做是因为选股因子是横截面概念；pooled 回归会被时间趋势污染。
+
+    `keep` 里额外保留的列（通常是标签列 y_excess）——**必须传**，否则残差表里没有标签，
+    下游 daily_ic(pred_col=..., y_col=...) 会 KeyError（2026-11-06 实测踩到）。
     """
+    keep = [c for c in (keep or []) if c in df.columns and c != target]
     out = []
     for _, g in df.groupby("date", sort=False):
         g = g.dropna(subset=[target] + feats)
@@ -56,11 +61,11 @@ def _cs_residual(df: pd.DataFrame, target: str, feats: list[str]) -> pd.DataFram
         except np.linalg.LinAlgError:
             continue
         resid = y - X @ coef
-        sub = g[["date", target]].copy()
+        sub = g[["date", target] + keep].copy()
         sub["resid"] = resid
         out.append(sub)
     if not out:
-        return pd.DataFrame(columns=["date", target, "resid"])
+        return pd.DataFrame(columns=["date", target] + keep + ["resid"])
     return pd.concat(out, ignore_index=True)
 
 
@@ -196,7 +201,7 @@ def main() -> int:
         print(f"  [{nf}] 原始 IC={s_raw['ic_mean']:+.4f} ICIR={s_raw['icir']:+.4f} "
               f"年化ICIR={s_raw['icir_annual']:+.2f} 正占比={s_raw['ic_positive_rate']:.3f} "
               f"t={s_raw['t_stat']:.2f} n_days={s_raw['n_days']}")
-        res = _cs_residual(df, nf, old_factors)
+        res = _cs_residual(df, nf, old_factors, keep=[ycol])
         if res.empty:
             print(f"  [{nf}] 残差计算失败（样本不足）")
             continue

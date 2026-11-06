@@ -28,6 +28,7 @@ import ctypes
 import glob
 import json
 import os
+import socket
 import sys
 import threading
 import time
@@ -37,6 +38,14 @@ import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[2]
+
+# baostock 的 socket **默认无超时**：查询卡住时 `th.join(timeout)` 只能回收线程，
+# 挂住的 socket 读仍在，并**污染 baostock 的全局连接状态** → 后续所有查询全部卡死
+# （2026-11-06 实测：整片 30 分钟零产出、python CPU 增量恒为 0；9-16 同样记录过
+#  「join(timeout) 对整体挂死无效」）。
+# 设置 socket 级超时后，socket 先于线程超时抛错 → 线程干净退出、连接可重建。
+# 取 25s：必须**小于** QUERY_TIMEOUT(30s)，否则线程先放弃、socket 仍挂着，污染照旧。
+socket.setdefaulttimeout(25)
 
 
 def _hard_delete(path: Path) -> None:
@@ -218,8 +227,21 @@ def fetch_batch(symbols: list[str], sleep: float, partial_path: Path,
             time.sleep(sleep)
         if (i + 1) % 25 == 0:
             acc.to_parquet(partial_path, index=False)  # 增量落盘防丢失
+            # 定期重登：baostock 连接一旦被服务端半关闭，后续查询会**一直卡住**
+            # （2026-11-06 实测：整片 30 分钟零产出、CPU 增量恒为 0）。
+            # 重登重建 socket，是把「永久僵死」变回「偶发失败可重试」的关键。
+            try:
+                bs.logout()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                lg2 = bs.login()
+                if lg2.error_code != "0":
+                    print(f"  [WARN] 周期重登失败: {lg2.error_code} {lg2.error_msg}", flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"  [WARN] 周期重登异常: {repr(e)[:100]}", flush=True)
             print(f"  processed {i+1}/{len(symbols)} symbols, {len(acc)} rows, "
-                  f"{time.time()-t0:.0f}s [增量落盘]", flush=True)
+                  f"{time.time()-t0:.0f}s [增量落盘+重登]", flush=True)
 
     # ---- 修复轮：网络类错误(10002007 接收数据异常)是**瞬时**的，实测会连片出现 ----
     # 主轮失败的 symbol 若直接丢弃，final parquet 会**静默缺标的** → 覆盖率虚高、
