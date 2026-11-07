@@ -92,7 +92,7 @@ def main() -> int:
         return 1
     print(f"[33b] 标签列 = {ycol}")
 
-    need = ["date", ycol] + old_factors + new_factors
+    need = ["date", "symbol", ycol] + old_factors + new_factors
     need = [c for c in need if c in cols]
     df = pd.read_parquet(src, columns=need)
     print(f"[33b] 载入 {len(df):,} 行 | 日期 {df['date'].min().date()}~{df['date'].max().date()}"

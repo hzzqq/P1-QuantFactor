@@ -86,6 +86,11 @@ QUERY_TIMEOUT = 30  # 单只股票查询线程超时(s)，防 baostock 无 timeo
 MAX_RETRIES = 3     # 单只失败重试次数
 RETRY_BACKOFF = 2.0  # 重试间隔(s)
 REPAIR_ROUNDS = 3    # 主轮后补拉失败标的的轮数（网络错误 10002007 是瞬时的，会连片出现）
+# 补拉轮之间的退避基数(s)。轮间等待 = REPAIR_BACKOFF*3，轮内单只重试间隔 = REPAIR_BACKOFF。
+# ⚠️ 2026-11-07 实测：本常量**曾被引用但从未定义** → 补拉轮一旦触发就抛
+#    NameError: name 'REPAIR_BACKOFF' is not defined，整片进程当场死掉（实测 86s 跑完 75 只即崩），
+#    于是「补拉」这道保险本身成了故障源，片 09 永远补不齐（11-06 覆盖率卡 93.36% 的原因之一）。
+REPAIR_BACKOFF = 5.0
 
 
 def to_bs_code(symbol: str) -> str:
