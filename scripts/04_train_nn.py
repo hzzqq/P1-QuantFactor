@@ -67,13 +67,21 @@ def main() -> int:
     parser.add_argument("--label-clip", type=float, default=0.5,
                         help="剔除 |超额收益| 超过该值的样本（异常复权/停牌复牌）")
     parser.add_argument("--out", default=None)
+    parser.add_argument("--ds", type=str, default=None,
+                        help="数据集 parquet 文件名（默认 dataset_h{horizon}.parquet；"
+                             "v41 重训传 dataset_h10_v41.parquet）")
+    parser.add_argument("--meta", type=str, default=None,
+                        help="数据集 meta 文件名（默认 dataset_h{horizon}_meta.json）")
     args = parser.parse_args()
 
     cfg = load_config(CONFIG_PATH)
     horizon = args.horizon or cfg.get_path("label.horizon", 10)
     seed = cfg.get_path("seed", 42)
+    _tag = f"_{args.tag}" if args.tag else ""
 
-    meta_path = PROCESSED / f"dataset_h{horizon}_meta.json"
+    ds_name = args.ds or f"dataset_h{horizon}.parquet"
+    meta_name = args.meta or f"dataset_h{horizon}_meta.json"
+    meta_path = PROCESSED / meta_name
     if not meta_path.exists():
         logger.error("找不到 %s，请先运行 02_build_features.py", meta_path)
         return 1
@@ -81,7 +89,7 @@ def main() -> int:
         factor_names = json.load(f)["factor_names"]
 
     t0 = time.time()
-    data = pd.read_parquet(PROCESSED / f"dataset_h{horizon}.parquet")
+    data = pd.read_parquet(PROCESSED / ds_name)
     data = data.replace([np.inf, -np.inf], np.nan).dropna(subset=["y_excess"])
     if args.label_clip > 0:
         before = len(data)
@@ -89,6 +97,13 @@ def main() -> int:
         logger.info("标签截断 |y|<=%s：%s -> %s 行（剔除 %s）",
                     args.label_clip, f"{before:,}", f"{len(data):,}",
                     f"{before - len(data):,}")
+    # 数据质量护栏：剔除 (date,symbol) 完全重复行（v39/v41 构建遗留的精确重复，约 0.5%；
+    # 原生 dataset_h10 无重复，此步对其为 no-op）。重复行会导致 build_3d 的 pivot 失败。
+    dup0 = len(data)
+    data = data.drop_duplicates(subset=["date", "symbol"], keep="first")
+    if len(data) < dup0:
+        logger.warning("剔除精确重复 (date,symbol) 行：%s -> %s（数据质量修复）",
+                       f"{dup0:,}", f"{len(data):,}")
     logger.info("数据集 %s 行 | %s 只股票 | %s 因子",
                 f"{len(data):,}", data["symbol"].nunique(), len(factor_names))
 
@@ -120,6 +135,13 @@ def main() -> int:
         tr_m, va_m, te_m, sym_m = ds_mod.make_masks(
             dates, train_end, valid_end, symbols, symbol_subset
         )
+        # R-fix（2026-11-12）：make_masks 的 test=(d>valid_cut) 无上界，
+        # 会把目标年份之后的所有年份也纳入测试 → 同一 (date,symbol) 被多个年份的
+        # 模型重复预测（跨年重复行，raw 文件 1.86× 冗余且混入更早模型的越期预测）。
+        # 严格 walk-forward 要求：日期 d 的 OOS 预测只来自年份==d 的模型。
+        # 故把测试掩码钳制到目标年份 y。等价于「v41 重训后按 year==date.year 去重」。
+        yr = pd.to_datetime(pd.Series(dates)).dt.year.to_numpy()
+        te_m = te_m & (yr == y)
         if tr_m.sum() == 0 or te_m.sum() == 0:
             logger.warning("跳过 %s：训练或测试区间为空", y)
             continue
@@ -165,12 +187,12 @@ def main() -> int:
             model, train_ds, valid_ds, epochs=args.epochs,
             batch_size=args.batch_size, lr=args.lr, patience=4,
             num_threads=args.threads, seed=seed,
-            checkpoint_path=str(MODELS_DIR / f"{args.model}_ckpt_h{horizon}_{y}.pt"),
+            checkpoint_path=str(MODELS_DIR / f"{args.model}_ckpt_h{horizon}_{y}{_tag}.pt"),
         )
 
         # 保存该年最佳模型权重，供 P5 导出 ONNX / 部署（待办：对接 P5）
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
-        ckpt = MODELS_DIR / f"{args.model}_best_h{horizon}_{y}.pt"
+        ckpt = MODELS_DIR / f"{args.model}_best_h{horizon}_{y}{_tag}.pt"
         torch.save(model.state_dict(), ckpt)
         logger.info("模型权重已保存: %s", ckpt)
 
