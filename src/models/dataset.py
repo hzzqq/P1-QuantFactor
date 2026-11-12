@@ -103,7 +103,7 @@ class SequenceDataset(Dataset):
                  symbol_mask: np.ndarray | None = None,
                  date_mask: np.ndarray | None = None,
                  date_stride: int = 1, max_nan_ratio: float = 0.2,
-                 fill: str = "zero"):
+                 fill: str = "zero", require_y: bool = True):
         self.X3d = X3d
         self.y3d = y3d
         self.seq_len = seq_len
@@ -116,11 +116,12 @@ class SequenceDataset(Dataset):
             date_mask = np.ones(n_d, dtype=bool)
 
         self.indices = self._collect(symbol_mask, date_mask, date_stride,
-                                     max_nan_ratio)
+                                     max_nan_ratio, require_y)
         logger.info("序列数据集: %s 个样本（seq_len=%s, stride=%s）",
                     f"{len(self.indices):,}", seq_len, date_stride)
 
-    def _collect(self, symbol_mask, date_mask, stride, max_nan) -> np.ndarray:
+    def _collect(self, symbol_mask, date_mask, stride, max_nan,
+                 require_y: bool = True) -> np.ndarray:
         n_s, n_d, n_f = self.X3d.shape
         min_valid = 1.0 - max_nan
         out: list[tuple[int, int]] = []
@@ -136,7 +137,13 @@ class SequenceDataset(Dataset):
             win_sum = csum[self.seq_len:] - csum[:-self.seq_len]
             ratio = win_sum.sum(axis=1) / float(self.seq_len * n_f)
 
-            y_valid = np.isfinite(self.y3d[s, self.seq_len - 1:])
+            if require_y:
+                y_valid = np.isfinite(self.y3d[s, self.seq_len - 1:])
+            else:
+                # 实时模式：放行尾部无标签交易日（如最新日，尚无未来收益标签），
+                # 仅用特征打分，不要求有标签。窗口内特征缺失仍按 ratio 卡控。
+                y_valid = np.ones(self.y3d[s, self.seq_len - 1:].shape,
+                                  dtype=bool)
             d_valid = date_mask[self.seq_len - 1:]
             ok = np.where((ratio >= min_valid) & y_valid & d_valid)[0]
             if stride > 1:

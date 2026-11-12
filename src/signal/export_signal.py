@@ -92,11 +92,20 @@ def build_signals(preds: pd.DataFrame,
 
 def export_to_file(preds: pd.DataFrame, out_path: Path,
                    top_n: int = 20, model: str = "baseline_lgb",
-                   horizon: int = 10) -> dict:
+                   horizon: int = 10, quality: dict | None = None) -> dict:
+    """导出信号 JSON。
+
+    quality：可选质量标注块（默认 None，不写入，保持原有 schema 不变）。
+    用于给已诊断出问题的信号路（如近期反号的 gru）打「仅供研究、禁止决策」警示，
+    供下游消费端（StockSignal 54/55 页 / 晨报）识别。附加字段不破坏
+    ks 侧 HEALTHY_KEYS 结构闸（只校验 6 个必需键存在，不拒绝额外字段）。
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     sig = build_signals(preds, top_n=top_n)
     sig["model"] = model
     sig["horizon"] = horizon
+    if quality is not None:
+        sig["quality"] = quality
     with out_path.open("w", encoding="utf-8") as f:
         json.dump(sig, f, ensure_ascii=False, indent=2)
     return sig

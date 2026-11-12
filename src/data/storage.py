@@ -116,6 +116,12 @@ def build_panel(symbols: list[str] | None = None) -> pd.DataFrame:
         return pd.DataFrame()
     panel = pd.concat(frames, ignore_index=True)
     panel = panel.sort_values(["symbol", "date"]).reset_index(drop=True)
+    # N16：raw kline 经桥接 append 可能含重复 (date,symbol) 行，写入前清掉，
+    # 与 build_dataset 口径 (keep='last') 一致，避免下游 pivot / 回测崩溃、标签错乱。
+    dup = int(panel.duplicated(subset=["date", "symbol"]).sum())
+    if dup:
+        logger.warning("build_panel 发现 %s 个重复 (date,symbol) 行，已去重(保留末条)", dup)
+        panel = panel.drop_duplicates(subset=["date", "symbol"], keep="last")
     return panel
 
 

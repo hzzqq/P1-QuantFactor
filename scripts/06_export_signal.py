@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -33,7 +34,17 @@ def main() -> int:
     ap.add_argument("--model", default="baseline_lgb")
     ap.add_argument("--horizon", type=int, default=10)
     ap.add_argument("--top-n", type=int, default=20)
+    ap.add_argument("--quality-json", default=None,
+                    help="可选：附加质量标注块的 JSON 字符串（如给已反号信号路打『仅供研究』警示）")
     args = ap.parse_args()
+
+    quality = None
+    if args.quality_json:
+        try:
+            quality = json.loads(args.quality_json)
+        except json.JSONDecodeError as e:
+            logger.error("--quality-json 非法 JSON: %s", e)
+            return 1
 
     _model_file = {"gru": "gru", "baseline": "baseline",
                    "fusion": "fusion"}.get(args.model, "baseline")
@@ -47,7 +58,7 @@ def main() -> int:
     preds = pd.read_parquet(pred_path)
     out = PROCESSED / "signals" / f"signal_{args.model}_h{args.horizon}.json"
     sig = export_to_file(preds, out, top_n=args.top_n,
-                         model=args.model, horizon=args.horizon)
+                         model=args.model, horizon=args.horizon, quality=quality)
     logger.info("信号已导出: %s", out)
     logger.info("最新交易日 %s | Top 看多 %d 只 | Top 看空 %d 只",
                 sig["latest_date"], len(sig["top_long"]), len(sig["top_short"]))

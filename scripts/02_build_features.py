@@ -49,6 +49,8 @@ def main() -> int:
                         help="预测未来 N 日，默认取配置值")
     parser.add_argument("--rebuild-panel", action="store_true",
                         help="强制从 raw 文件重建面板")
+    parser.add_argument("--keep-unlabeled", action="store_true",
+                        help="保留无未来标签的尾部交易日(如最新日)，供实时信号出分")
     parser.add_argument("--out", default=None, help="输出文件名")
     args = parser.parse_args()
 
@@ -76,7 +78,8 @@ def main() -> int:
     bench = load_benchmark(benchmark)
     logger.info("基准 %s: %s 行", benchmark, f"{len(bench):,}")
 
-    data = pipeline.build_dataset(panel, bench, horizon=horizon, windows=windows)
+    data = pipeline.build_dataset(panel, bench, horizon=horizon, windows=windows,
+                                  keep_unlabeled=args.keep_unlabeled)
 
     names = data.attrs.get("factor_names", [])
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)

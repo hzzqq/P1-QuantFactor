@@ -203,6 +203,11 @@ def run_backtest_continuous(preds: pd.DataFrame,
     c_sell0 = float(cost["commission"]) + float(cost["stamp"])
 
     df = panel[["symbol", "date", "open", "close"]].sort_values(["symbol", "date"]).copy()
+    # N16：面板可能含重复 (date,symbol) 行（桥接 append 写出），pivot 会因重复索引
+    # 直接崩 (ValueError: Index contains duplicate entries)。此处与 build_dataset /
+    # storage.build_panel 口径一致 (keep='last') 去重，作为回测层防御，避免静默崩溃。
+    if int(df.duplicated(subset=["date", "symbol"]).sum()):
+        df = df.drop_duplicates(subset=["date", "symbol"], keep="last")
     df["prev_close"] = df.groupby("symbol")["close"].shift(1)
     df["day_ret"] = df["close"] / df["prev_close"] - 1.0
     df["is_lu"] = (df["day_ret"] >= LIMIT_UP).fillna(False)

@@ -58,6 +58,8 @@ def main() -> int:
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--weight", type=str, default=DEFAULT_WEIGHT)
     ap.add_argument("--seq-len", type=int, default=SEQ_LEN)
+    ap.add_argument("--live", action="store_true",
+                   help="实时信号模式：保留无未来标签的尾部交易日(如最新日)一并出分")
     args = ap.parse_args()
     t0 = time.time()
 
@@ -73,11 +75,17 @@ def main() -> int:
         data = data[keep]
     # 逐列降 float32 + inf 置 NaN（等价于原 replace/dropna，但不申请整表 bool 掩码）
     ds_mod.slim_frame(data, list(factor_names) + ["y_excess"])
-    y_arr = data["y_excess"].to_numpy(dtype="float64", copy=False)
-    mask = np.isfinite(y_arr)
-    if LABEL_CLIP > 0:
-        mask &= np.abs(y_arr) <= LABEL_CLIP
-    data = data.loc[mask]
+    if args.live:
+        # 实时模式：保留全部行（含无 y_excess 的最新交易日），仅用特征打分。
+        n_tail = int(data["y_excess"].isna().sum())
+        logger.info("实时模式：保留全部样本（含 %s 个无标签尾部交易日，"
+                    "模型预测、尚未有实现收益验证）", f"{n_tail:,}")
+    else:
+        y_arr = data["y_excess"].to_numpy(dtype="float64", copy=False)
+        mask = np.isfinite(y_arr)
+        if LABEL_CLIP > 0:
+            mask &= np.abs(y_arr) <= LABEL_CLIP
+        data = data.loc[mask]
     logger.info("EV 数据集 %s 行 | %s 只 | %s 因子",
                 f"{len(data):,}", data["symbol"].nunique(), len(factor_names))
 
@@ -104,7 +112,8 @@ def main() -> int:
     if te_m.sum() == 0:
         logger.error("2026 测试窗口为空")
         return 1
-    test_ds = ds_mod.SequenceDataset(X3d, y3d, args.seq_len, sym_m, te_m, date_stride=1)
+    test_ds = ds_mod.SequenceDataset(X3d, y3d, args.seq_len, sym_m, te_m,
+                                     date_stride=1, require_y=not args.live)
     logger.info("test 样本数: %s", f"{len(test_ds):,}")
 
     model = gru_attn.GRUAttention(n_f, hidden=hid, n_layers=nl)

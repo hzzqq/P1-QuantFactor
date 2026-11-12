@@ -60,6 +60,9 @@ def load_prices() -> tuple[dict[str, pd.DataFrame], list[pd.Timestamp]]:
         df = pd.read_parquet(f)
         df["date"] = pd.to_datetime(df["date"]).dt.normalize()
         df = df.sort_values("date").reset_index(drop=True)
+        # N16：kline 经桥接 append 可能含重复 date 行，去重(保留末条)避免
+        # set_index("date") 出现非唯一索引 → bench_curve 内 .get(prev) 返回 Series 崩。
+        df = df.drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
         frames[str(df["symbol"].iloc[0])] = df[["date", "open", "close"]].copy()
     # 全局日历：所有股票日期并集（任一 A 股交易日至少有一只股票有记录）
     all_days = sorted({d for df in frames.values() for d in df["date"].tolist()})

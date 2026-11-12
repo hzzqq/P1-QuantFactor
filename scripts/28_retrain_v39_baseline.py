@@ -44,6 +44,8 @@ def main() -> int:
     ap.add_argument("--valid-years", type=int, default=2)
     ap.add_argument("--rounds", type=int, default=400)
     ap.add_argument("--label-clip", type=float, default=0.5)
+    ap.add_argument("--live", action="store_true",
+                   help="实时信号模式：保留无未来标签的尾部交易日(如最新日)供预测")
     ap.add_argument("--label-horizon", type=int, default=10,
                     help="make_masks 回滚天数；h20 须传 20")
     ap.add_argument("--eval-metric", type=str, default="ic")
@@ -63,13 +65,24 @@ def main() -> int:
     lo = pd.Timestamp(year=lo_year, month=1, day=1)
     hi = pd.Timestamp(year=hi_year, month=12, day=31)
     data = pd.read_parquet(PROCESSED / args.ds, filters=[("date", ">=", lo), ("date", "<=", hi)]) \
-        .replace([np.inf, -np.inf], np.nan).dropna(subset=["y_excess"])
+        .replace([np.inf, -np.inf], np.nan)
+    if args.live:
+        # 实时模式：保留尾部无标签交易日(如最新日)供预测；训练集(label 有限部分)
+        # 仍按原口径清洗(去离群)，保证模型与离线生产一致，仅追加尾部行供出分。
+        finite = data["y_excess"].notna()
+        clean = finite & (data["y_excess"].abs() <= args.label_clip) \
+            if args.label_clip > 0 else finite
+        data = data[clean | ~finite]
+        logger.info("实时模式：保留 %s 个尾部无标签样本（供预测），训练集按原口径清洗",
+                    f"{int((~finite).sum()):,}")
+    else:
+        data = data.dropna(subset=["y_excess"])
+        if args.label_clip > 0:
+            data = data[data["y_excess"].abs() <= args.label_clip]
     # 因子列 downcast 到 float32，减半内存
     fcols = [c for c in data.columns if c not in ("date", "symbol", "y_cls", "y_fwd")]
     data[fcols] = data[fcols].astype(np.float32)
     del fcols
-    if args.label_clip > 0:
-        data = data[data["y_excess"].abs() <= args.label_clip]
     logger.info("v39 数据集 %s 行 | %s 因子", f"{len(data):,}", len(factor_names))
 
     test_years = [int(y) for y in args.test_years.split(",") if y.strip()]

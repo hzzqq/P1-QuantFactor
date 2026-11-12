@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# P1 每日信号推进驱动脚本 v5（自动化用；T-251，2026-10-11；v3: T-352 增 S11 fusion 环节，2026-10-30；v4: 2026-11-01 增 S12 绩效实证刷新；v5: 2026-11-01 增 S13 敏感性矩阵刷新）
+# P1 每日信号推进驱动脚本 v6（自动化用；T-251，2026-10-11；v3: T-352 增 S11 fusion 环节，2026-10-30；v4: 2026-11-01 增 S12 绩效实证刷新；v5: 2026-11-01 增 S13 敏感性矩阵刷新；v6: 2026-11-10 实时信号模式 live：S01 保留尾部无标签交易日，S04/S05/S06/S07 对最新日一并出分，latest_date 推至真实最新交易日 11-09；最末日为模型预测、尚无实现收益验证）
+# 诚实边界：fusion(S11) 用前瞻 y_excess 标签，仍滞后于四路(设计性)，不参与 latest_date 一致性门禁。
 # 步骤：重建面板+dataset_h10 → EV 数据集重建(新) → 并入 log_amount(v39/v48) →
 #       GRU 仅推理 → EV predict-only(新，复用生产权重不重训) → baseline(v39) 2026 增补 →
 #       baseline(原) 2026 增补 → 合并×2 → 集成 → 导出四路(gru/baseline/ens/ev) →
@@ -27,8 +28,8 @@ ng(){ echo "$(date '+%F %T') FAIL $1" >> "$HB"; }
 
 # [S01] 重建面板（来自已扩展的 kline）+ dataset_h10
 if need S01; then
-  step "S01/11 rebuild panel + dataset_h10"
-  "$PY" scripts/02_build_features.py --rebuild-panel || { echo "STEP1 FAIL"; ng S01; exit 1; }
+  step "S01/11 rebuild panel + dataset_h10 (live: 保留尾部无标签交易日)"
+  "$PY" scripts/02_build_features.py --rebuild-panel --keep-unlabeled || { echo "STEP1 FAIL"; ng S01; exit 1; }
   ok S01
 fi
 
@@ -49,22 +50,22 @@ fi
 
 # [S04] GRU 仅推理（不重训）
 if need S04; then
-  step "S04/11 gru predict-only"
-  "$PY" scripts/zz_predict_only_gru.py --horizon 10 --seq-len 20 --threads 8 || { echo "STEP4 FAIL"; ng S04; exit 1; }
+  step "S04/11 gru predict-only (live)"
+  "$PY" scripts/zz_predict_only_gru.py --horizon 10 --seq-len 20 --threads 8 --live || { echo "STEP4 FAIL"; ng S04; exit 1; }
   ok S04
 fi
 
 # [S05] EV predict-only（T-244：生产权重 gru_ev_t10_seq40_h128_lr1e-3，不重训，新增）
 if need S05; then
-  step "S05/11 EV predict-only"
-  "$PY" scripts/zz_predict_only_ev.py --threads 8 || { echo "STEP5 FAIL"; ng S05; exit 1; }
+  step "S05/11 EV predict-only (live)"
+  "$PY" scripts/zz_predict_only_ev.py --threads 8 --live || { echo "STEP5 FAIL"; ng S05; exit 1; }
   ok S05
 fi
 
 # [S06] baseline v39 —— 仅跑 2026，落 part 后合并进 consolidated
 if need S06; then
-  step "S06/11 baseline v39 (2026 only)"
-  "$PY" scripts/28_retrain_v39_baseline.py --test-years 2026 \
+  step "S06/11 baseline v39 (2026 only, live)"
+  "$PY" scripts/28_retrain_v39_baseline.py --test-years 2026 --live \
       --out-part pred_baseline_h10_v39_2026_new.parquet \
       --yearly-part yearly_v39_2026_new.json || { echo "STEP6 FAIL"; ng S06; exit 1; }
   "$PY" - <<'PYEOF' || { echo "STEP6 MERGE FAIL"; ng S06m; exit 1; }
@@ -85,9 +86,9 @@ fi
 
 # [S07] baseline 原版(38因子) —— 用 28 指向 dataset_h10，仅跑 2026，合并
 if need S07; then
-  step "S07/11 baseline original (2026 only)"
+  step "S07/11 baseline original (2026 only, live)"
   "$PY" scripts/28_retrain_v39_baseline.py --ds dataset_h10.parquet --meta dataset_h10_meta.json \
-      --test-years 2026 --out-part pred_baseline_h10_2026_new.parquet \
+      --test-years 2026 --live --out-part pred_baseline_h10_2026_new.parquet \
       --yearly-part yearly_2026_new.json || { echo "STEP7 FAIL"; ng S07; exit 1; }
   "$PY" - <<'PYEOF' || { echo "STEP7 MERGE FAIL"; ng S07m; exit 1; }
 import sys
@@ -113,9 +114,16 @@ if need S08; then
 fi
 
 # [S09] 导出信号（gru / baseline / ens / ev 四路；ens 走 zz_export_ens.py，可 --exclude-gru-unique）
+# 2026-11-11：gru 独立信号路近 59 日已反号（Rank-IC≈-0.177，显著为负），
+# 但 S09a/S10 仍把它推给 ks 侧作「灰度参考」，有误导人工决策的风险。
+# 处理 = 保留推送以维持四路 latest_date 一致性门禁，但固化 quality 标注：
+# 「仅供研究、禁止用于投资决策」，让 ks 消费端可识别。证据见
+# data/P1/processed/reports/recent_edge_diag_20261111.md 与 gru_weight_scan_20261111.md。
+# 注：ens 集成内 gru 权重已于 2026-11-01 置 0，本独立路不并入 ens，不影响 ens 信号。
+GRU_QUALITY='{"status":"research_only","usable_for_decision":false,"warning":"GRU 独立信号路近期已反号，仅供研究对照，禁止用于投资决策","evidence":{"window":"2026-08-11~2026-11-09(59交易日)","rank_ic_recent":-0.177,"ls_t_recent":-4.37,"reports":["reports/recent_edge_diag_20261111.md","reports/gru_weight_scan_20261111.md"]},"annotated_at":"2026-11-11","note":"ens 集成内 gru 权重已于 2026-11-01 置 0；本独立路未并入 ens，其反号不影响 ens 信号，但作为独立展示信号有误导风险"}'
 if need S09; then
   step "S09/11 export signals"
-  "$PY" scripts/06_export_signal.py --model gru --horizon 10 || { echo "STEP9a FAIL"; ng S09a; exit 1; }
+  "$PY" scripts/06_export_signal.py --model gru --horizon 10 --quality-json "$GRU_QUALITY" || { echo "STEP9a FAIL"; ng S09a; exit 1; }
   "$PY" scripts/06_export_signal.py --model baseline --horizon 10 || { echo "STEP9b FAIL"; ng S09b; exit 1; }
   "$PY" scripts/zz_export_ens.py || { echo "STEP9c FAIL"; ng S09c; exit 1; }
   "$PY" scripts/06_export_signal.py --pred "$PD/pred_gru_ev_t10_seq40_h128_lr1e-3_h10.parquet" \

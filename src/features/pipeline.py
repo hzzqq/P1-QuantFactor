@@ -77,7 +77,8 @@ def iter_factors(panel: pd.DataFrame, windows: list[int] | None = None):
 
 def build_dataset(panel: pd.DataFrame, bench_df: pd.DataFrame, horizon: int = 10,
                   windows: list[int] | None = None, winsor: float = 5.0,
-                  min_feature_ratio: float = 0.6) -> pd.DataFrame:
+                  min_feature_ratio: float = 0.6,
+                  keep_unlabeled: bool = False) -> pd.DataFrame:
     """构建建模数据集（long 格式）。
 
     Returns:
@@ -110,7 +111,7 @@ def build_dataset(panel: pd.DataFrame, bench_df: pd.DataFrame, horizon: int = 10
         "y_fwd": _stack(labs["fwd_ret"]),
     })
 
-    data = X.join(y, how="inner")
+    data = X.join(y, how="left" if keep_unlabeled else "inner")
 
     # 除零会产生 inf（如停牌日价格为 0），必须清理。
     # 只要有一个 inf，mean() 之类的统计结果就会被整体污染成 NaN。
@@ -121,11 +122,18 @@ def build_dataset(panel: pd.DataFrame, bench_df: pd.DataFrame, horizon: int = 10
     valid = data[names].notna().sum(axis=1) >= thresh
     data = data[valid]
 
-    # 标签缺失（未来数据不足）的样本必须丢弃
-    before = len(data)
-    data = data.dropna(subset=["y_excess"])
-    logger.info("过滤后样本 %s 行（丢弃 %s 行：因子不足或标签缺失）",
-                f"{len(data):,}", f"{before - len(data):,}")
+    if keep_unlabeled:
+        # 实时信号模式（N16）：保留无标签（未来 10 日数据不足）的尾部样本，
+        # 供模型对「最新面板日」打分；因子缺失过多的已在上一步丢弃。
+        n_tail = int(data["y_excess"].isna().sum())
+        logger.info("实时模式：保留 %s 个无标签尾部样本（不丢弃），因子数 %s",
+                    f"{n_tail:,}", len(names))
+    else:
+        # 标签缺失（未来数据不足）的样本必须丢弃
+        before = len(data)
+        data = data.dropna(subset=["y_excess"])
+        logger.info("过滤后样本 %s 行（丢弃 %s 行：因子不足或标签缺失）",
+                    f"{len(data):,}", f"{before - len(data):,}")
 
     data = data.reset_index()
     # R9：特征/标签默认 float64，全市场宽表驻留近 GB。落盘前降为 float32

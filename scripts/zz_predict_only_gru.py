@@ -53,6 +53,8 @@ def main() -> int:
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--label-clip", type=float, default=0.5)
     ap.add_argument("--train-years", type=int, default=3)
+    ap.add_argument("--live", action="store_true",
+                   help="实时信号模式：保留无未来标签的尾部交易日(如最新日)一并出分")
     args = ap.parse_args()
 
     cfg = load_config(CONFIG_PATH)
@@ -71,14 +73,20 @@ def main() -> int:
     # 逐列降 float32 并把 inf 置 NaN：等价于原 replace([inf,-inf], nan)，
     # 但不为整表申请 bool 掩码（内存紧张时那 113MB 就是压垮进程的一笔，2026-11-05 实测）
     ds_mod.slim_frame(data, list(factor_names) + ["y_excess"])
-    y_arr = data["y_excess"].to_numpy(dtype="float64", copy=False)
-    mask = np.isfinite(y_arr)
-    if args.label_clip > 0:
-        mask &= np.abs(y_arr) <= args.label_clip
-    before = len(data)
-    data = data.loc[mask]
-    if args.label_clip > 0:
-        logger.info("标签截断: %s -> %s", f"{before:,}", f"{len(data):,}")
+    if args.live:
+        # 实时模式：保留全部行（含无 y_excess 的最新交易日），仅用特征打分。
+        n_tail = int(data["y_excess"].isna().sum())
+        logger.info("实时模式：保留全部样本（含 %s 个无标签尾部交易日，"
+                    "模型预测、尚未有实现收益验证）", f"{n_tail:,}")
+    else:
+        y_arr = data["y_excess"].to_numpy(dtype="float64", copy=False)
+        mask = np.isfinite(y_arr)
+        if args.label_clip > 0:
+            mask &= np.abs(y_arr) <= args.label_clip
+        before = len(data)
+        data = data.loc[mask]
+        if args.label_clip > 0:
+            logger.info("标签截断: %s -> %s", f"{before:,}", f"{len(data):,}")
     logger.info("数据集 %s 行 | %s 只 | %s 因子",
                 f"{len(data):,}", data["symbol"].nunique(), len(factor_names))
 
@@ -101,7 +109,8 @@ def main() -> int:
             logger.warning("跳过 %s：测试区间为空", y)
             continue
         test_ds = ds_mod.SequenceDataset(X3d, y3d, args.seq_len, sym_m, te_m,
-                                         date_stride=1)
+                                         date_stride=1,
+                                         require_y=not args.live)
         ckpt = MODELS_DIR / f"gru_best_h{horizon}_{y}.pt"
         if not ckpt.exists():
             logger.warning("跳过 %s：无权重 %s", y, ckpt.name)
