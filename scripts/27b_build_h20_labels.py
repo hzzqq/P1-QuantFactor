@@ -10,6 +10,7 @@ merge 进现有 dataset_h10_v39，避免一次性载 3.32M 行撞沙箱每进程
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -39,6 +40,9 @@ SRC_META = PROCESSED / "dataset_h10_v39_meta.json"
 DST_META = PROCESSED / f"dataset_h20_v39_meta.json"
 BENCH = "sh000300"
 BATCH = 200_000
+# 实时信号模式：保留尾部无未来 20 日标签的行（NaN y_excess），供 28 --live 出最新日预测。
+# 默认关闭（= 原离线口径，dropna 保持历史不变）；部署实时信号时置 1。
+KEEP_TAIL = os.environ.get("H20_KEEP_TAIL", "0") == "1"
 
 
 def main() -> int:
@@ -78,7 +82,9 @@ def main() -> int:
         df = df.rename(columns={"y_excess": "y_excess_h10"})
         df["y_excess"] = df["y_excess_h20"]
         df = df.drop(columns=["y_excess_h20"])
-        df = df.dropna(subset=["y_excess"])
+        if not KEEP_TAIL:
+            # 离线口径：仅保留有 20 日未来标签的行（尾部无未来标签者删去）
+            df = df.dropna(subset=["y_excess"])
         if len(df) == 0:
             continue
         # 因子 downcast 省内存/磁盘
