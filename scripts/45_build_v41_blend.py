@@ -55,10 +55,20 @@ F_V39_LGB = "pred_baseline_h10_v39.parquet"
 F_V41_HGB = "pred_baseline_h10_v41.parquet"
 
 
-def _z(df: pd.DataFrame, col: str = "pred") -> pd.Series:
+def _z(df: pd.DataFrame, col: str = "pred", clip: tuple | None = (-6, 6)) -> pd.Series:
+    """逐日截面 z 分数。
+
+    clip 默认 (-6, 6)：放宽原 ±3。原 ±3 会把顶端多只股票压到精确 3.0 天花板，
+    导致 blend（z 加权）在最新交易日 ≥30 只并列 3.0、top20/榜单排序退化（且信号显示 +300%）。
+    放宽到 ±6 既能打破顶端并列（区分度恢复），又兜住极少数极端离群值，对回测（前 10% 多空）
+    净夏普影响极小。clip=None 则不裁剪。
+    """
     g = df.groupby("date")[col]
-    return ((df[col] - g.transform("mean")) / g.transform("std").replace(0.0, np.nan)
-            ).fillna(0.0).clip(-3, 3)
+    z = ((df[col] - g.transform("mean")) / g.transform("std").replace(0.0, np.nan)
+         ).fillna(0.0)
+    if clip is not None:
+        z = z.clip(*clip)
+    return z
 
 
 def _dedup(d: pd.DataFrame) -> pd.DataFrame:
@@ -107,11 +117,14 @@ def main() -> int:
     panel["date"] = pd.to_datetime(panel["date"])
 
     lo = max(A["date"].min(), C_raw["date"].min())
-    hi = min(A["date"].max(), C_raw["date"].max())
-    clip = lambda d: d[(d["date"] >= lo) & (d["date"] <= hi)].copy()
-    A, C_raw = clip(A), clip(C_raw)
+    # 上界取 A 全量：v41(C) 缺失的尾部（>C.max）由下方 C_pad 回退纯 A（见 missing 填充），
+    # 保证 blend 信号覆盖到现役 A 的最新交易日，不滞后约两周。
+    hi = A["date"].max()
+    A = A[(A["date"] >= lo) & (A["date"] <= hi)].copy()
+    C_raw = C_raw[C_raw["date"] >= lo].copy()   # C 不裁上界；尾部缺失键由 C_pad 用 A 回填
     panel = panel[(panel["date"] >= lo) & (panel["date"] <= hi)]
-    print(f"[45] 对齐区间 {lo.date()}~{hi.date()} | A {len(A):,} / C_raw {len(C_raw):,}")
+    print(f"[45] 对齐区间 {lo.date()}~{hi.date()} | A {len(A):,} / C_raw {len(C_raw):,} "
+          f"（尾部>C.max 回退纯 A，信号不滞后）")
 
     # z_A 在共同窗口重算；C_pad 缺失键回退 A 的 z
     A["pred"] = _z(A, "pred")
